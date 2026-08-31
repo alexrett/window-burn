@@ -37,7 +37,15 @@ On first launch, grant Window Burn these permissions in **System Settings → Pr
 - **Screen Recording** — captures the window snapshot used by the effect.
 - **Input Monitoring** — detects close-button clicks and interactive torch gestures.
 
-Restart Window Burn after granting the permissions.
+The Screen Recording permission may not display a system prompt. If Window Burn is missing from
+that list, add it manually:
+
+1. Open **System Settings → Privacy & Security → Screen & System Audio Recording**
+   (called **Screen Recording** on some macOS versions).
+2. Click **+**, choose `/Applications/Window Burn.app`, and enable it.
+3. Quit and reopen Window Burn.
+
+Restart Window Burn after changing any of the three permissions.
 
 ## Effects
 
