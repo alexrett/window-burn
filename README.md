@@ -22,9 +22,11 @@ animated torch, or soak it first for the full two-act treatment.
 Requires macOS 14 Sonoma or newer. The release is universal for Apple Silicon and Intel Macs.
 
 ```bash
-brew tap alexrett/tap
-brew install --cask window-burn
+brew install --cask alexrett/tap/window-burn
 ```
+
+If Homebrew had already cached `alexrett/tap` before this cask was published, run `brew update`
+once and retry the install.
 
 You can also download `WindowBurn.dmg` from the
 [latest GitHub release](https://github.com/alexrett/window-burn/releases/latest).
