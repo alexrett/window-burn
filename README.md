@@ -12,6 +12,19 @@ Window Burn is a small menu bar utility that brings the gloriously unnecessary w
 of the Linux desktop's golden age to modern macOS. Close a window normally, ignite it with an
 animated torch, or soak it first for the full two-act treatment.
 
+## Demo
+
+<p align="center">
+  <a href="docs/window-burn-demo.mp4">
+    <img src="docs/window-burn-demo.gif" width="800" alt="Window Burn demo: close, torch, and soak-and-burn modes">
+  </a>
+</p>
+
+<p align="center">
+  Close and burn · Torch · Soak and burn<br>
+  <a href="docs/window-burn-demo.mp4">Watch the full-quality MP4</a>
+</p>
+
 > [!CAUTION]
 > Window Burn means it. When a document asks whether to save unsaved changes, the app
 > automatically chooses **Delete / Don't Save** before starting the effect. Those changes
