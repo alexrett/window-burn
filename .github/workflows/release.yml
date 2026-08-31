@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode 26.2
+        run: sudo xcode-select -s /Applications/Xcode_26.2.app
+      - name: Verify tag and project version
+        run: |
+          version="$(plutil -extract CFBundleShortVersionString raw Support/Info.plist)"
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Lint and test
+        run: |
+          swift format lint --strict --recursive Package.swift Sources Tests
+          swift test
+      - name: Import Developer ID certificate
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/window-burn.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -k "$keychain" \
+            -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          security list-keychains -d user -s "$keychain"
+      - name: Prepare notarization inputs
+        env:
+          SIGN_IDENTITY: ${{ secrets.WB_MACOS_SIGN_IDENTITY }}
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.WB_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.WB_NOTARY_ISSUER_ID }}
+        run: |
+          signing_package="$RUNNER_TEMP/signing-package"
+          mkdir -p "$signing_package"
+          printf '%s' "$SIGN_IDENTITY" > "$signing_package/WB_MACOS_SIGN_IDENTITY.txt"
+          printf '%s' "$NOTARY_KEY" > "$signing_package/MACOS_NOTARY_KEY.txt"
+          printf '%s' "$NOTARY_KEY_ID" > "$signing_package/WB_NOTARY_KEY_ID.txt"
+          printf '%s' "$NOTARY_ISSUER_ID" > "$signing_package/WB_NOTARY_ISSUER_ID.txt"
+      - name: Build, sign, and notarize
+        env:
+          WINDOW_BURN_SIGNING_PACKAGE: ${{ runner.temp }}/signing-package
+          WINDOW_BURN_SIGNING_IDENTITY: ${{ secrets.WB_MACOS_SIGN_IDENTITY }}
+        run: ./script/build_release.sh
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/release/WindowBurn.dmg \
+            --verify-tag \
+            --title "Window Burn ${GITHUB_REF_NAME#v}" \
+            --generate-notes
