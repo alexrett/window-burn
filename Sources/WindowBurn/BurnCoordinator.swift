@@ -241,8 +241,8 @@ final class BurnCoordinator {
 
   func cancelSoakAndBurn() {
     guard soakAndBurnSession.phase != .readyToSoak else { return }
-    overlay.dismiss()
     resetSoakAndBurn()
+    overlay.dismiss()
     logger.info("Soak-and-burn mode was cancelled")
   }
 
@@ -263,15 +263,12 @@ final class BurnCoordinator {
         width: size.width,
         height: size.height
       )
-      let panelFrame = contentFrame.insetBy(
-        dx: -BurnOverlayController.padding,
-        dy: -BurnOverlayController.padding
-      )
       let profile = BurnProfile.random()
       try overlay.present(
         image: image,
-        panelFrame: panelFrame,
+        panelFrame: contentFrame,
         profile: profile,
+        presentation: .demoWindow,
         onFirstFrame: nil,
         completion: { [weak self] in
           self?.isBusy = false
@@ -281,6 +278,76 @@ final class BurnCoordinator {
     } catch {
       isBusy = false
       logger.error("Demo burn failed: \(error.localizedDescription, privacy: .public)")
+      showError(error)
+    }
+  }
+
+  func showSoakDemo() {
+    guard !isBusy else { return }
+    isBusy = true
+    logger.info("Starting soak-and-burn demo")
+
+    do {
+      let size = CGSize(width: 720, height: 430)
+      let image = try DemoImageFactory.make(size: size)
+      let visibleFrame =
+        NSScreen.main?.visibleFrame
+        ?? CGRect(x: 0, y: 0, width: 1_200, height: 800)
+      let contentFrame = CGRect(
+        x: visibleFrame.midX - size.width / 2,
+        y: visibleFrame.midY - size.height / 2,
+        width: size.width,
+        height: size.height
+      )
+      let profile = BurnProfile(
+        duration: 3.4,
+        seed: 41,
+        tilt: 0,
+        turbulence: 1.15,
+        charWidth: 0.075
+      )
+      let soakPoints = [
+        BurnIgnitionPoint(x: 0.42, y: 0.40),
+        BurnIgnitionPoint(x: 0.47, y: 0.44),
+        BurnIgnitionPoint(x: 0.52, y: 0.41),
+        BurnIgnitionPoint(x: 0.56, y: 0.46),
+        BurnIgnitionPoint(x: 0.50, y: 0.50),
+      ]
+      try overlay.present(
+        image: image,
+        panelFrame: contentFrame,
+        profile: profile,
+        style: .soakAndBurn(initialSoakPoints: [soakPoints[0]]),
+        presentation: .demoWindow,
+        onFirstFrame: nil,
+        completion: { [weak self] in
+          self?.isBusy = false
+          self?.logger.info("Soak-and-burn demo completed")
+        }
+      )
+
+      Task { @MainActor [weak self] in
+        for point in soakPoints.dropFirst() {
+          try? await Task.sleep(for: .seconds(0.18))
+          guard let self, self.isBusy else { return }
+          _ = self.overlay.addSoakPoint(point)
+        }
+
+        try? await Task.sleep(for: .seconds(5.0))
+        guard let self, self.isBusy else { return }
+        _ = self.overlay.finishSoaking()
+        self.logger.info("Soak demo reached full wetness")
+
+        try? await Task.sleep(for: .seconds(2.4))
+        guard self.isBusy else { return }
+        _ = self.overlay.igniteSoakedWindow(
+          at: BurnIgnitionPoint(x: 0.49, y: 0.24)
+        )
+        self.logger.info("Soak demo ignited")
+      }
+    } catch {
+      isBusy = false
+      logger.error("Soak demo failed: \(error.localizedDescription, privacy: .public)")
       showError(error)
     }
   }
@@ -344,7 +411,8 @@ final class BurnCoordinator {
           mainDisplayHeight: NSScreen.screens.first?.frame.maxY ?? 0,
           padding: BurnOverlayController.padding
         )
-        guard !pendingSoakTrail.points.isEmpty else {
+        let initialSoakPoints = pendingSoakTrail.points
+        guard !initialSoakPoints.isEmpty else {
           throw WindowCaptureError.noMatchingWindow
         }
 
@@ -352,22 +420,24 @@ final class BurnCoordinator {
         let profile = BurnProfile.randomTorch()
         try overlay.present(
           image: capturedWindow.image,
+          backdropImage: capturedWindow.backdropImage,
           panelFrame: panelFrame,
           profile: profile,
-          style: .soakAndBurn(initialSoakPoints: pendingSoakTrail.points),
+          style: .soakAndBurn(initialSoakPoints: initialSoakPoints),
           onFirstFrame: nil,
           completion: { [weak self] in
             self?.finishSoakAndBurn()
           }
         )
         isSoakOverlayActive = true
+        pendingSoakTrail = SoakTrail()
         onSoakCaptureStateChange?(false)
         if pendingSoakRelease || soakAndBurnSession.phase == .readyToBurn {
           pendingSoakRelease = false
           _ = overlay.finishSoaking()
         }
         logger.info(
-          "Started soaking pid \(accessibleWindow.target.ownerPID) with \(self.pendingSoakTrail.points.count) sampled point(s)"
+          "Started soaking pid \(accessibleWindow.target.ownerPID) with \(initialSoakPoints.count) sampled point(s)"
         )
       } catch {
         resetSoakAndBurn()

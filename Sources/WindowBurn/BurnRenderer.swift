@@ -38,16 +38,24 @@ enum BurnRendererStyle {
 final class BurnRenderer: NSObject, MTKViewDelegate {
   private let commandQueue: MTLCommandQueue
   private let pipeline: MTLRenderPipelineState
+  private let clearWetPipeline: MTLComputePipelineState
+  private let accumulateWetPipeline: MTLComputePipelineState
   private let texture: MTLTexture
+  private let backdropTexture: MTLTexture
+  private let wetAccumulationTexture: MTLTexture
   private let sampler: MTLSamplerState
   private let profile: BurnProfile
+  private let visualProfile: BurnVisualProfile
+  private let wetVisualProfile: WetVisualProfile
   private let style: BurnRendererStyle
   private let horizontalPadding: Float
   private let verticalPadding: Float
   private let completion: () -> Void
   private var ignitionField: TorchIgnitionField
-  private var soakTrail: SoakTrail
+  private var wetDepositQueue: WetDepositQueue
+  private var isWetTextureInitialized = false
   private var startTime: CFTimeInterval?
+  private var lastDrawTime: CFTimeInterval?
   private var soakEndedAt: TimeInterval?
   private var burnStartedAt: TimeInterval?
   private var hasCompleted = false
@@ -55,6 +63,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   init(
     device: MTLDevice,
     image: CGImage,
+    backdropImage: CGImage?,
     profile: BurnProfile,
     style: BurnRendererStyle,
     horizontalPadding: Float,
@@ -66,6 +75,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     }
     self.commandQueue = commandQueue
     self.profile = profile
+    self.visualProfile = .cinematic
+    self.wetVisualProfile = .cinematic
     self.style = style
     self.horizontalPadding = horizontalPadding
     self.verticalPadding = verticalPadding
@@ -77,13 +88,13 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       }
     }
     self.ignitionField = ignitionField
-    var soakTrail = SoakTrail()
+    var wetDepositQueue = WetDepositQueue()
     if case .soakAndBurn(let initialSoakPoints) = style {
       for point in initialSoakPoints {
-        _ = soakTrail.add(point)
+        _ = wetDepositQueue.add(point)
       }
     }
-    self.soakTrail = soakTrail
+    self.wetDepositQueue = wetDepositQueue
 
     let library: MTLLibrary
     do {
@@ -93,7 +104,9 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     }
     guard
       let vertexFunction = library.makeFunction(name: "burnVertex"),
-      let fragmentFunction = library.makeFunction(name: "burnFragment")
+      let fragmentFunction = library.makeFunction(name: "burnFragment"),
+      let clearWetFunction = library.makeFunction(name: "clearWetField"),
+      let accumulateWetFunction = library.makeFunction(name: "accumulateWetField")
     else {
       throw BurnRendererError.shaderFunction
     }
@@ -111,17 +124,48 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
     do {
       pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
+      clearWetPipeline = try device.makeComputePipelineState(function: clearWetFunction)
+      accumulateWetPipeline = try device.makeComputePipelineState(function: accumulateWetFunction)
     } catch {
       throw BurnRendererError.pipeline(error.localizedDescription)
     }
 
+    let imageAspect = CGFloat(image.width) / CGFloat(max(1, image.height))
+    let wetTextureWidth: Int
+    let wetTextureHeight: Int
+    if imageAspect >= 1 {
+      wetTextureWidth = 256
+      wetTextureHeight = max(64, Int((256 / imageAspect).rounded()))
+    } else {
+      wetTextureWidth = max(64, Int((256 * imageAspect).rounded()))
+      wetTextureHeight = 256
+    }
+    let wetTextureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .r16Float,
+      width: wetTextureWidth,
+      height: wetTextureHeight,
+      mipmapped: false
+    )
+    wetTextureDescriptor.storageMode = .private
+    wetTextureDescriptor.usage = [.shaderRead, .shaderWrite]
+    guard let wetAccumulationTexture = device.makeTexture(descriptor: wetTextureDescriptor) else {
+      throw BurnRendererError.texture("Metal could not create the wet accumulation texture.")
+    }
+    self.wetAccumulationTexture = wetAccumulationTexture
+
+    let textureLoader = MTKTextureLoader(device: device)
+    let textureOptions: [MTKTextureLoader.Option: Any] = [
+      .origin: MTKTextureLoader.Origin.topLeft,
+      .SRGB: false,
+    ]
     do {
-      texture = try MTKTextureLoader(device: device).newTexture(
+      texture = try textureLoader.newTexture(
         cgImage: image,
-        options: [
-          .origin: MTKTextureLoader.Origin.topLeft,
-          .SRGB: false,
-        ]
+        options: textureOptions
+      )
+      backdropTexture = try textureLoader.newTexture(
+        cgImage: backdropImage ?? image,
+        options: textureOptions
       )
     } catch {
       throw BurnRendererError.texture(error.localizedDescription)
@@ -141,7 +185,9 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   }
 
   func start() {
-    startTime = CACurrentMediaTime()
+    let now = CACurrentMediaTime()
+    startTime = now
+    lastDrawTime = now
   }
 
   @discardableResult
@@ -163,7 +209,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   @discardableResult
   func addSoakPoint(_ point: BurnIgnitionPoint) -> Bool {
     guard case .soakAndBurn = style, soakEndedAt == nil else { return false }
-    return soakTrail.add(point)
+    return wetDepositQueue.add(point)
   }
 
   @discardableResult
@@ -185,12 +231,36 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       !hasCompleted,
       let drawable = view.currentDrawable,
       let renderPass = view.currentRenderPassDescriptor,
-      let commandBuffer = commandQueue.makeCommandBuffer(),
-      let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass)
+      let commandBuffer = commandQueue.makeCommandBuffer()
     else { return }
 
     let now = CACurrentMediaTime()
     let elapsed = startTime.map { now - $0 } ?? 0
+    let frameDuration = min(max(now - (lastDrawTime ?? now), 0), 1.0 / 15.0)
+    lastDrawTime = now
+    var wetDeposits = wetDepositQueue.takePendingDeposits().map { point in
+      SIMD4<Float>(
+        point.x,
+        point.y,
+        profile.seed + point.x * 137.3 + point.y * 271.9,
+        0.34
+      )
+    }
+    if soakEndedAt == nil, let activePoint = wetDepositQueue.latestPoint {
+      wetDeposits.append(
+        SIMD4<Float>(
+          activePoint.x,
+          activePoint.y,
+          profile.seed + activePoint.x * 137.3 + activePoint.y * 271.9,
+          max(0.012, Float(frameDuration) * 0.82)
+        )
+      )
+    }
+    guard encodeWetFieldUpdates(wetDeposits, on: commandBuffer) else { return }
+    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else {
+      return
+    }
+
     let burnElapsed: TimeInterval
     if case .soakAndBurn = style {
       burnElapsed = burnStartedAt.map { max(0, elapsed - $0) } ?? 0
@@ -216,27 +286,63 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       case .soakAndBurn: 2
       }
     }()
+    let impactFade: Float = {
+      guard let soakEndedAt else { return 1 }
+      return max(0, 1 - Float((elapsed - soakEndedAt) / 0.24))
+    }()
+    let activeWetPoint = impactFade > 0 ? wetDepositQueue.latestPoint : nil
     var mode = SIMD4<Float>(
       effectMode,
       Float(ignitionField.ignitions.count),
       Float(profile.duration),
-      Float(soakTrail.points.count)
+      activeWetPoint == nil ? 0 : 1
     )
     let soakingDuration = min(elapsed, soakEndedAt ?? elapsed)
+    let hasWetContent = wetDepositQueue.totalPointCount > 0
     var wetInfo = SIMD4<Float>(
-      soakTrail.points.isEmpty ? 0 : SoakEffect.wetness(heldFor: soakingDuration),
+      hasWetContent ? SoakEffect.wetness(heldFor: soakingDuration) : 0,
       burnStartedAt == nil ? (soakEndedAt == nil ? 0 : 1) : 2,
-      0,
+      hasWetContent ? SoakEffect.amount(heldFor: soakingDuration) : 0,
+      hasWetContent ? 1 : 0
+    )
+    var flameLayers = SIMD4<Float>(
+      visualProfile.hotCoreWidth,
+      visualProfile.emberWidth,
+      visualProfile.glowWidth,
+      visualProfile.flameReach
+    )
+    var fireMaterial = SIMD2<Float>(
+      visualProfile.sparkDensity,
+      visualProfile.residualCharOpacity
+    )
+    var waterOptics = SIMD4<Float>(
+      wetVisualProfile.refractionStrength,
+      wetVisualProfile.dispersionStrength,
+      wetVisualProfile.reflectionStrength,
+      wetVisualProfile.highlightIntensity
+    )
+    var waterDetail = SIMD4<Float>(
+      wetVisualProfile.dropletDensity,
+      wetVisualProfile.verticalSag,
+      wetVisualProfile.urineTintStrength,
       0
     )
-    var wetUniforms = soakTrail.points.enumerated().map { index, point in
-      SIMD4<Float>(
-        point.x,
-        point.y,
-        profile.seed + Float(index) * 11.73,
-        0
-      )
-    }
+    var waterGeometry = SIMD4<Float>(
+      wetVisualProfile.impactRadius,
+      wetVisualProfile.absorptionRadius,
+      wetVisualProfile.backgroundBlurRadius,
+      wetVisualProfile.backgroundBlurStrength
+    )
+    var wetPaperDamage = SIMD4<Float>(
+      wetVisualProfile.wrinkleStartDensity,
+      wetVisualProfile.wrinkleFullDensity,
+      wetVisualProfile.tearStartDensity,
+      wetVisualProfile.tearFullDensity
+    )
+    var wetUniforms =
+      activeWetPoint.map { point in
+        [SIMD4<Float>(point.x, point.y, profile.seed + 11.73, impactFade)]
+      } ?? []
     if wetUniforms.isEmpty {
       wetUniforms.append(.zero)
     }
@@ -253,7 +359,19 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     }
 
     encoder.setRenderPipelineState(pipeline)
+    encoder.setViewport(
+      MTLViewport(
+        originX: 0,
+        originY: 0,
+        width: Double(drawable.texture.width),
+        height: Double(drawable.texture.height),
+        znear: 0,
+        zfar: 1
+      )
+    )
     encoder.setFragmentTexture(texture, index: 0)
+    encoder.setFragmentTexture(wetAccumulationTexture, index: 1)
+    encoder.setFragmentTexture(backdropTexture, index: 2)
     encoder.setFragmentSamplerState(sampler, index: 0)
     encoder.setFragmentBytes(&timing, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
     encoder.setFragmentBytes(&padding, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
@@ -269,6 +387,36 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       encoder.setFragmentBytes(baseAddress, length: bytes.count, index: 6)
     }
     encoder.setFragmentBytes(&wetInfo, length: MemoryLayout<SIMD4<Float>>.stride, index: 7)
+    encoder.setFragmentBytes(
+      &flameLayers,
+      length: MemoryLayout<SIMD4<Float>>.stride,
+      index: 8
+    )
+    encoder.setFragmentBytes(
+      &fireMaterial,
+      length: MemoryLayout<SIMD2<Float>>.stride,
+      index: 9
+    )
+    encoder.setFragmentBytes(
+      &waterOptics,
+      length: MemoryLayout<SIMD4<Float>>.stride,
+      index: 10
+    )
+    encoder.setFragmentBytes(
+      &waterDetail,
+      length: MemoryLayout<SIMD4<Float>>.stride,
+      index: 11
+    )
+    encoder.setFragmentBytes(
+      &waterGeometry,
+      length: MemoryLayout<SIMD4<Float>>.stride,
+      index: 12
+    )
+    encoder.setFragmentBytes(
+      &wetPaperDamage,
+      length: MemoryLayout<SIMD4<Float>>.stride,
+      index: 13
+    )
     encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
     encoder.endEncoding()
     commandBuffer.present(drawable)
@@ -283,6 +431,79 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       view.isPaused = true
       completion()
     }
+  }
+
+  private func encodeWetFieldUpdates(
+    _ deposits: [SIMD4<Float>],
+    on commandBuffer: MTLCommandBuffer
+  ) -> Bool {
+    if !isWetTextureInitialized {
+      guard let clearEncoder = commandBuffer.makeComputeCommandEncoder() else {
+        return false
+      }
+      clearEncoder.setComputePipelineState(clearWetPipeline)
+      clearEncoder.setTexture(wetAccumulationTexture, index: 0)
+      clearEncoder.dispatchThreads(
+        MTLSize(
+          width: wetAccumulationTexture.width,
+          height: wetAccumulationTexture.height,
+          depth: 1
+        ),
+        threadsPerThreadgroup: computeThreadgroupSize(for: clearWetPipeline)
+      )
+      clearEncoder.endEncoding()
+      isWetTextureInitialized = true
+    }
+
+    var fieldInfo = SIMD4<Float>(
+      Float(texture.width) / Float(max(1, texture.height)),
+      wetVisualProfile.absorptionRadius,
+      wetVisualProfile.verticalSag,
+      profile.seed
+    )
+    let maximumBatchSize = 64
+    for batchStart in stride(from: 0, to: deposits.count, by: maximumBatchSize) {
+      guard let accumulateEncoder = commandBuffer.makeComputeCommandEncoder() else {
+        return false
+      }
+      let batchEnd = min(batchStart + maximumBatchSize, deposits.count)
+      let batchUniforms = Array(deposits[batchStart..<batchEnd])
+      var pointCount = UInt32(batchUniforms.count)
+      accumulateEncoder.setComputePipelineState(accumulateWetPipeline)
+      accumulateEncoder.setTexture(wetAccumulationTexture, index: 0)
+      batchUniforms.withUnsafeBytes { bytes in
+        guard let baseAddress = bytes.baseAddress else { return }
+        accumulateEncoder.setBytes(baseAddress, length: bytes.count, index: 0)
+      }
+      accumulateEncoder.setBytes(
+        &pointCount,
+        length: MemoryLayout<UInt32>.stride,
+        index: 1
+      )
+      accumulateEncoder.setBytes(
+        &fieldInfo,
+        length: MemoryLayout<SIMD4<Float>>.stride,
+        index: 2
+      )
+      accumulateEncoder.dispatchThreads(
+        MTLSize(
+          width: wetAccumulationTexture.width,
+          height: wetAccumulationTexture.height,
+          depth: 1
+        ),
+        threadsPerThreadgroup: computeThreadgroupSize(for: accumulateWetPipeline)
+      )
+      accumulateEncoder.endEncoding()
+    }
+    return true
+  }
+
+  private func computeThreadgroupSize(
+    for pipeline: MTLComputePipelineState
+  ) -> MTLSize {
+    let width = pipeline.threadExecutionWidth
+    let height = max(1, pipeline.maxTotalThreadsPerThreadgroup / width)
+    return MTLSize(width: width, height: height, depth: 1)
   }
 
   private static let shaderSource = #"""
@@ -343,9 +564,75 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         return value;
     }
 
+    kernel void clearWetField(
+        texture2d<float, access::write> wetField [[texture(0)]],
+        uint2 position [[thread_position_in_grid]]
+    ) {
+        if (position.x >= wetField.get_width()
+            || position.y >= wetField.get_height()) {
+            return;
+        }
+        wetField.write(float4(0.0), position);
+    }
+
+    kernel void accumulateWetField(
+        texture2d<float, access::read_write> wetField [[texture(0)]],
+        constant float4 *wetPoints [[buffer(0)]],
+        constant uint &wetPointCount [[buffer(1)]],
+        constant float4 &fieldInfo [[buffer(2)]],
+        uint2 position [[thread_position_in_grid]]
+    ) {
+        if (position.x >= wetField.get_width()
+            || position.y >= wetField.get_height()) {
+            return;
+        }
+
+        float2 fieldSize = float2(
+            wetField.get_width(),
+            wetField.get_height()
+        );
+        float2 uv = (float2(position) + 0.5) / fieldSize;
+        float aspect = fieldInfo.x;
+        float absorptionRadius = fieldInfo.y;
+        float verticalSag = fieldInfo.z;
+        float density = wetField.read(position).r;
+
+        for (uint index = 0; index < wetPointCount; index++) {
+            float4 wetPoint = wetPoints[index];
+            float2 physicalDelta = (uv - wetPoint.xy) * float2(aspect, 1.0);
+            float distance = length(physicalDelta);
+            float angle = atan2(physicalDelta.y, physicalDelta.x);
+            float radialDirectionY = distance > 0.0001
+                ? physicalDelta.y / distance
+                : 0.0;
+            float edgeVariation = sin(angle * 3.0 + wetPoint.z * 0.021) * 0.075;
+            edgeVariation += sin(angle * 7.0 - wetPoint.z * 0.013) * 0.045;
+            edgeVariation += (valueNoise(
+                uv * float2(31.0, 27.0) + wetPoint.z * 0.017
+            ) - 0.5) * 0.16;
+            float radius = absorptionRadius * (0.90 + edgeVariation);
+            radius += verticalSag
+                * 0.42
+                * smoothstep(-0.18, 0.92, radialDirectionY);
+            float contribution = 1.0 - smoothstep(
+                radius * 0.42,
+                radius,
+                distance
+            );
+            contribution *= 0.78 + valueNoise(
+                uv * float2(83.0, 49.0) + wetPoint.z * 0.011
+            ) * 0.22;
+            density += contribution * max(0.0, wetPoint.w);
+        }
+
+        wetField.write(float4(min(density, 64.0), 0.0, 0.0, 1.0), position);
+    }
+
     fragment float4 burnFragment(
         VertexOut input [[stage_in]],
         texture2d<float> image [[texture(0)]],
+        texture2d<float> wetField [[texture(1)]],
+        texture2d<float> backdrop [[texture(2)]],
         sampler imageSampler [[sampler(0)]],
         constant float2 &timing [[buffer(0)]],
         constant float2 &padding [[buffer(1)]],
@@ -354,7 +641,13 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         constant float4 &mode [[buffer(4)]],
         constant float4 *ignitions [[buffer(5)]],
         constant float4 *wetPoints [[buffer(6)]],
-        constant float4 &wetInfo [[buffer(7)]]
+        constant float4 &wetInfo [[buffer(7)]],
+        constant float4 &flameLayers [[buffer(8)]],
+        constant float2 &fireMaterial [[buffer(9)]],
+        constant float4 &waterOptics [[buffer(10)]],
+        constant float4 &waterDetail [[buffer(11)]],
+        constant float4 &waterGeometry [[buffer(12)]],
+        constant float4 &wetPaperDamage [[buffer(13)]]
     ) {
         float progress = timing.x;
         float time = timing.y;
@@ -362,6 +655,27 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         float tilt = variation.y;
         float turbulence = variation.z;
         float charWidth = variation.w;
+        float hotCoreWidth = flameLayers.x;
+        float emberWidth = flameLayers.y;
+        float glowWidth = flameLayers.z;
+        float maximumFlameReach = flameLayers.w;
+        float sparkDensity = fireMaterial.x;
+        float residualCharOpacity = fireMaterial.y;
+        float refractionStrength = waterOptics.x;
+        float dispersionStrength = waterOptics.y;
+        float reflectionStrength = waterOptics.z;
+        float highlightIntensity = waterOptics.w;
+        float dropletDensity = waterDetail.x;
+        float verticalSag = waterDetail.y;
+        float urineTintStrength = waterDetail.z;
+        float impactRadius = waterGeometry.x;
+        float absorptionRadius = waterGeometry.y;
+        float backgroundBlurRadius = waterGeometry.z;
+        float backgroundBlurStrength = waterGeometry.w;
+        float wrinkleStartDensity = wetPaperDamage.x;
+        float wrinkleFullDensity = wetPaperDamage.y;
+        float tearStartDensity = wetPaperDamage.z;
+        float tearFullDensity = wetPaperDamage.w;
         float effectMode = mode.x;
         float radialMode = step(0.5, effectMode);
         float soakMode = step(1.5, effectMode);
@@ -381,8 +695,10 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         float ragged = (coarse - 0.5) * 0.19 * turbulence
             + (detail - 0.5) * 0.052
             + (fibers - 0.5) * 0.016;
+        float broadArc = sin(imageUV.x * 3.14159265) * 0.055;
         float front = progress * 1.24 - 0.12
             + tilt * (imageUV.x - 0.5)
+            + broadArc
             + ragged;
         float signedDistance = imageUV.y - front;
 
@@ -414,189 +730,831 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
 
         float grain = fbm(imageUV * float2(31.0, 19.0) + seedOffset * 3.7);
         float pinholeNoise = valueNoise(imageUV * float2(83.0, 47.0) + seedOffset * 8.1);
-        float charCore = insideMask
+        float scorchBand = insideMask
             * step(0.0, signedDistance)
-            * smoothstep(charWidth, 0.0, signedDistance);
-        float heatStain = insideMask
-            * step(0.0, signedDistance)
-            * smoothstep(charWidth * 2.65, charWidth * 0.30, signedDistance);
-        float pores = charCore
-            * smoothstep(0.64, 0.91, pinholeNoise + charCore * 0.23);
+            * (1.0 - smoothstep(0.0, charWidth * 1.35, signedDistance));
+        scorchBand *= 0.58 + grain * 0.42;
+        float pores = scorchBand
+            * smoothstep(0.74, 0.95, pinholeNoise + scorchBand * 0.18);
 
-        float keep = smoothstep(-0.015, 0.023, signedDistance);
-        keep *= 1.0 - pores * 0.94;
+        float edgeBreakup = (pinholeNoise - 0.5) * hotCoreWidth * 1.8;
+        float keep = smoothstep(
+            -hotCoreWidth * 0.55,
+            hotCoreWidth * 1.65,
+            signedDistance + edgeBreakup
+        );
         float2 sourceUV = imageUV;
         float wetMask = 0.0;
-        if (soakMode > 0.5 && wetPointCount > 0) {
+        float waterThickness = 0.0;
+        float wetRim = 0.0;
+        float dropletMask = 0.0;
+        float dropletRim = 0.0;
+        float dropletHighlight = 0.0;
+        float2 dropletDelta = float2(0.0);
+        float dropletRadius = 0.01;
+        float2 waterNormalXY = float2(0.0);
+        float absorptionMask = 0.0;
+        float liquidMask = 0.0;
+        float localFluidDensity = 0.0;
+        float wrinkleMask = 0.0;
+        float wrinkleRidge = 0.0;
+        float paperFoldLighting = 0.0;
+        float2 paperFoldNormal = float2(0.0);
+        float ruptureMask = 0.0;
+        float tornEdge = 0.0;
+        float tornLip = 0.0;
+        float tornShadow = 0.0;
+        if (soakMode > 0.5 && wetInfo.w > 0.5) {
             float wetness = wetInfo.x;
-            float wetReach = 0.10 + wetness * 0.88;
+            float fluidAmount = max(wetInfo.z, wetness);
+            float overflow = max(0.0, fluidAmount - 1.0);
+            float absorptionGrowth = 1.0 + log2(1.0 + overflow) * 0.20;
+            float liquidGrowth = 1.0 + log2(1.0 + overflow) * 0.10;
+            float stillSoaking = 1.0 - step(0.5, wetInfo.y);
             float seepNoise = fbm(
                 imageUV * float2(17.0, 12.0) + seedOffset * 5.0
             );
+            float2 wetTexel = 1.0 / float2(
+                wetField.get_width(),
+                wetField.get_height()
+            );
+            float bakedDensity = wetField.sample(
+                imageSampler,
+                clamp(imageUV, 0.0, 1.0)
+            ).r * insideMask;
+            localFluidDensity = bakedDensity;
+            absorptionMask = smoothstep(0.018, 0.28, bakedDensity);
+            liquidMask = smoothstep(0.28, 1.40, bakedDensity)
+                * mix(0.62, 1.0, stillSoaking);
+            waterThickness = clamp(bakedDensity * 0.20, 0.0, 0.62);
+            wetMask = max(absorptionMask * 0.62, liquidMask);
+
+            float wrinkleProgress = smoothstep(
+                wrinkleStartDensity,
+                wrinkleFullDensity,
+                bakedDensity
+            );
+            float2 paperCoordinate = imageUV * float2(aspect, 1.0);
+            float foldWarp = fbm(
+                imageUV * float2(10.0, 8.0) + seedOffset * 4.3
+            ) * 6.0;
+            float foldPhaseA = dot(
+                paperCoordinate,
+                float2(0.84, 0.54)
+            ) * 49.0 + foldWarp;
+            float foldPhaseB = dot(
+                paperCoordinate,
+                float2(-0.48, 0.88)
+            ) * 38.0 - foldWarp * 0.72;
+            float foldWaveA = sin(foldPhaseA);
+            float foldWaveB = sin(foldPhaseB);
+            float foldGateA = smoothstep(
+                0.28,
+                0.64,
+                valueNoise(imageUV * float2(15.0, 12.0) + seedOffset * 7.0)
+            );
+            float foldGateB = smoothstep(
+                0.34,
+                0.70,
+                valueNoise(imageUV * float2(11.0, 17.0) - seedOffset * 5.0)
+            );
+            float ridgeA = (1.0 - smoothstep(0.035, 0.30, abs(foldWaveA)))
+                * foldGateA;
+            float ridgeB = (1.0 - smoothstep(0.045, 0.32, abs(foldWaveB)))
+                * foldGateB;
+            wrinkleRidge = max(ridgeA, ridgeB * 0.78);
+            wrinkleMask = wrinkleProgress * absorptionMask;
+            paperFoldNormal = float2(
+                0.84 * ridgeA * sign(foldWaveA)
+                    - 0.48 * ridgeB * sign(foldWaveB),
+                0.54 * ridgeA * sign(foldWaveA)
+                    + 0.88 * ridgeB * sign(foldWaveB)
+            );
+            paperFoldLighting = clamp(
+                (
+                    cos(foldPhaseA) * ridgeA * 0.72
+                    + cos(foldPhaseB) * ridgeB * 0.48
+                ) * wrinkleMask,
+                -1.0,
+                1.0
+            );
+
+            float tearProgress = smoothstep(
+                tearStartDensity,
+                tearFullDensity,
+                bakedDensity
+            );
+            float fractureNoise = mix(
+                fbm(imageUV * float2(19.0, 15.0) + seedOffset * 11.0),
+                valueNoise(imageUV * float2(47.0, 31.0) - seedOffset * 13.0),
+                0.28
+            );
+            float fractureThreshold = mix(0.30, 0.70, fractureNoise)
+                - wrinkleRidge * 0.22;
+            float ruptureSignal = tearProgress - fractureThreshold;
+            ruptureMask = smoothstep(-0.10, 0.10, ruptureSignal)
+                * absorptionMask;
+            tornEdge = (
+                1.0 - smoothstep(0.035, 0.28, abs(ruptureSignal))
+            ) * smoothstep(0.02, 0.18, tearProgress)
+                * absorptionMask;
+            tornLip = tornEdge * (1.0 - step(0.0, ruptureSignal));
+            tornShadow = tornEdge * step(0.0, ruptureSignal);
+            float fieldLeft = wetField.sample(
+                imageSampler,
+                clamp(imageUV - float2(wetTexel.x, 0.0), 0.0, 1.0)
+            ).r;
+            float fieldRight = wetField.sample(
+                imageSampler,
+                clamp(imageUV + float2(wetTexel.x, 0.0), 0.0, 1.0)
+            ).r;
+            float fieldUp = wetField.sample(
+                imageSampler,
+                clamp(imageUV - float2(0.0, wetTexel.y), 0.0, 1.0)
+            ).r;
+            float fieldDown = wetField.sample(
+                imageSampler,
+                clamp(imageUV + float2(0.0, wetTexel.y), 0.0, 1.0)
+            ).r;
+            waterNormalXY = float2(
+                fieldLeft - fieldRight,
+                fieldUp - fieldDown
+            ) * 0.38;
+            float activeImpactRim = 0.0;
+            float activeImpactAmount = 0.0;
             for (uint index = 0; index < wetPointCount; index++) {
                 float4 wetPoint = wetPoints[index];
                 float2 wetDelta = imageUV - wetPoint.xy;
-                float downward = smoothstep(-0.035, 0.055, wetDelta.y);
-                float reachMask = 1.0 - smoothstep(
-                    wetReach * 0.68,
-                    wetReach,
-                    wetDelta.y
-                );
-                float streamWander = (
-                    sin(wetDelta.y * 33.0 + wetPoint.z * 0.031) * 0.5
-                    + valueNoise(float2(wetDelta.y * 9.0, wetPoint.z * 0.013))
-                    - 0.5
-                ) * (0.024 + wetness * 0.045);
-                float streamWidth = 0.014 + wetness * 0.040
-                    + max(0.0, wetDelta.y) * 0.035;
-                float stream = smoothstep(
-                    streamWidth,
-                    streamWidth * 0.18,
-                    abs(wetDelta.x - streamWander)
-                ) * downward * reachMask;
-                float splashDistance = length(float2(
-                    wetDelta.x * aspect,
-                    wetDelta.y * 1.8
-                ));
-                float splash = smoothstep(
-                    0.105 + wetness * 0.105,
-                    0.014,
-                    splashDistance
-                );
-                float seep = smoothstep(
-                    0.12 + seepNoise * 0.045,
-                    0.018,
-                    abs(wetDelta.x - streamWander * 0.55)
-                ) * downward * reachMask * (0.38 + seepNoise * 0.62);
-                wetMask = max(wetMask, max(splash, max(stream, seep * 0.68)));
-            }
-            wetMask *= insideMask * wetness;
+                float widthSeed = hash21(float2(wetPoint.z * 0.193, 43.1));
+                float activeImpact = clamp(wetPoint.w, 0.0, 1.0);
 
+                float edgeNoise = fbm(
+                    imageUV * float2(31.0, 27.0)
+                    + float2(wetPoint.z * 0.017, wetPoint.z * 0.029)
+                );
+                float fiberNoise = valueNoise(
+                    imageUV * float2(83.0, 49.0)
+                    + float2(wetPoint.z * 0.031, wetPoint.z * 0.011)
+                );
+                float2 filmDelta = wetDelta * float2(aspect, 1.0);
+                float filmDistance = length(filmDelta);
+                float filmAngle = atan2(filmDelta.y, filmDelta.x);
+                float localRadius = mix(
+                    impactRadius,
+                    absorptionRadius,
+                    wetness
+                ) * mix(0.91, 1.07, widthSeed) * absorptionGrowth;
+                float radialDirectionY = filmDistance > 0.0001
+                    ? filmDelta.y / filmDistance
+                    : 0.0;
+                float capillaryLobes = sin(
+                    filmAngle * 3.0 + wetPoint.z * 0.021
+                ) * 0.075;
+                capillaryLobes += sin(
+                    filmAngle * 7.0 - wetPoint.z * 0.013
+                ) * 0.045;
+                float gravitySag = verticalSag
+                    * wetness
+                    * 0.42
+                    * (1.0 + log2(1.0 + overflow) * 0.12)
+                    * smoothstep(-0.18, 0.92, radialDirectionY);
+                float edgeRadius = localRadius
+                    * (
+                        0.82
+                        + edgeNoise * 0.24
+                        + (fiberNoise - 0.5) * 0.08
+                        + capillaryLobes
+                    )
+                    + gravitySag;
+                float wetFilm = 1.0 - smoothstep(
+                    edgeRadius * 0.48,
+                    edgeRadius,
+                    filmDistance
+                );
+                wetFilm *= 0.80 + edgeNoise * 0.20;
+
+                float liquidRadius = mix(
+                    impactRadius * 0.68,
+                    impactRadius * 1.16,
+                    wetness
+                ) * liquidGrowth;
+                float liquidEdgeRadius = liquidRadius
+                    * (
+                        0.80
+                        + edgeNoise * 0.18
+                        + capillaryLobes * 0.88
+                    )
+                    + gravitySag * 0.58;
+                float liquidFilm = 1.0 - smoothstep(
+                    liquidEdgeRadius * 0.40,
+                    liquidEdgeRadius,
+                    filmDistance
+                );
+                liquidFilm *= mix(0.62, 1.0, stillSoaking);
+
+                float impactDistance = length(
+                    wetDelta * float2(aspect, 1.0)
+                );
+                float impactPulse = 0.91 + sin(time * 22.0) * 0.09;
+                float impactBody = (
+                    1.0 - smoothstep(
+                        impactRadius * 0.10,
+                        impactRadius * 0.72,
+                        impactDistance
+                    )
+                ) * activeImpact * impactPulse;
+                float sprayNoise = valueNoise(float2(
+                    filmAngle * 7.0 + wetPoint.z * 0.019,
+                    impactDistance * 91.0 + time * 1.7
+                ));
+                float impactRing = (
+                    smoothstep(
+                        impactRadius * 0.48,
+                        impactRadius * 0.72,
+                        impactDistance
+                    )
+                    * (
+                        1.0 - smoothstep(
+                            impactRadius * 0.72,
+                            impactRadius * 1.02,
+                            impactDistance
+                        )
+                    )
+                ) * activeImpact * smoothstep(0.46, 0.78, sprayNoise);
+                float sprayHalo = (
+                    1.0 - smoothstep(
+                        impactRadius * 0.62,
+                        absorptionRadius * 1.16,
+                        impactDistance
+                    )
+                ) * smoothstep(0.62, 0.88, sprayNoise)
+                    * activeImpact;
+
+                float liveWetFilm = wetFilm * activeImpact * 0.08;
+                float liveLiquidFilm = liquidFilm * activeImpact * 0.10;
+                float localWet = max(
+                    liveWetFilm,
+                    max(
+                        liveLiquidFilm,
+                        max(impactBody * 0.30, sprayHalo * 0.16)
+                    )
+                );
+                absorptionMask = 1.0
+                    - (1.0 - absorptionMask)
+                        * (1.0 - max(liveWetFilm, sprayHalo * 0.08));
+                float liquidContribution = max(
+                    liveLiquidFilm,
+                    impactBody * 0.24
+                );
+                liquidMask = 1.0
+                    - (1.0 - liquidMask) * (1.0 - liquidContribution);
+                absorptionMask = clamp(absorptionMask, 0.0, 1.0);
+                liquidMask = clamp(
+                    liquidMask,
+                    0.0,
+                    1.0
+                );
+                waterThickness = max(
+                    waterThickness,
+                    max(
+                        liveLiquidFilm * 0.38,
+                        max(impactBody * 0.32, sprayHalo * 0.12)
+                    )
+                );
+                localFluidDensity += liveLiquidFilm * 0.36;
+                localFluidDensity += impactBody * max(1.0, fluidAmount) * 0.54;
+                activeImpactRim = max(
+                    activeImpactRim,
+                    max(impactRing, sprayHalo * 0.34)
+                );
+                activeImpactAmount = max(activeImpactAmount, activeImpact);
+
+                if (localWet > wetMask) {
+                    float2 radialNormal = filmDistance > 0.0001
+                        ? normalize(filmDelta)
+                        : float2(0.0, -1.0);
+                    float2 capillaryNormal = float2(
+                        edgeNoise - 0.5,
+                        fiberNoise - 0.5
+                    );
+                    waterNormalXY = normalize(
+                        radialNormal + capillaryNormal * 0.38
+                    );
+                    wetMask = localWet;
+                }
+            }
+
+            float absorbedRim = smoothstep(0.08, 0.36, liquidMask)
+                * (1.0 - smoothstep(0.36, 0.76, liquidMask));
+            float rimBreakup = smoothstep(
+                0.57,
+                0.82,
+                fbm(imageUV * float2(43.0, 37.0) + seedOffset * 8.0)
+            );
+            wetRim = max(
+                absorbedRim * rimBreakup * 0.12,
+                activeImpactRim * 0.64
+            );
+
+            float2 dropletGrid = float2(34.0 * aspect, 26.0);
+            float2 dropletCell = floor(imageUV * dropletGrid);
+            float dropSeed = hash21(dropletCell + seedOffset * 13.0);
+            float dropSeedY = hash21(dropletCell.yx + seedOffset * 21.0 + 7.3);
+            float2 dropletCenter = (
+                dropletCell + float2(dropSeed, dropSeedY)
+            ) / dropletGrid;
+            dropletDelta = (imageUV - dropletCenter) * float2(aspect, 1.0);
+            dropletRadius = mix(0.0032, 0.0086, hash21(dropletCell + 41.7));
+            float dropletDistance = length(dropletDelta);
+            float dropletBody = 1.0 - smoothstep(
+                dropletRadius * 0.72,
+                dropletRadius,
+                dropletDistance
+            );
+            float dropletGate = step(1.0 - dropletDensity, dropSeed)
+                * smoothstep(0.20, 0.62, wetMask)
+                * mix(0.38, 1.0, activeImpactAmount);
+            dropletMask = dropletBody * dropletGate;
+            dropletRim = smoothstep(
+                dropletRadius * 0.38,
+                dropletRadius * 0.76,
+                dropletDistance
+            ) * dropletBody * dropletGate;
+            dropletHighlight = 1.0 - smoothstep(
+                dropletRadius * 0.10,
+                dropletRadius * 0.34,
+                length(dropletDelta + float2(
+                    dropletRadius * 0.25,
+                    dropletRadius * 0.28
+                ))
+            );
+            dropletHighlight *= dropletGate;
+
+            if (dropletMask > 0.001) {
+                float2 dropletNormal = dropletDelta / max(dropletRadius, 0.001);
+                waterNormalXY = mix(
+                    waterNormalXY,
+                    dropletNormal,
+                    dropletMask * 0.20
+                );
+            }
+
+            absorptionMask *= insideMask * wetness;
+            liquidMask *= insideMask * wetness;
+            wetMask = max(
+                max(absorptionMask * 0.62, liquidMask),
+                dropletMask
+            );
+            waterThickness = max(waterThickness, dropletMask) * wetness;
+            wetRim = max(wetRim, dropletRim) * insideMask * wetness;
             float ripple = sin(
                 imageUV.y * 95.0
-                + time * 2.6
                 + fbm(imageUV * 21.0 + seedOffset) * 8.0
             );
-            sourceUV.x += ripple * wetMask * (0.004 + wetness * 0.009);
-            sourceUV.y += (seepNoise - 0.5) * wetMask * 0.012;
+            float2 microCoordinate = imageUV * float2(73.0, 57.0)
+                + seedOffset * 9.0;
+            float2 microNormal = float2(
+                valueNoise(microCoordinate + float2(0.41, 0.0))
+                    - valueNoise(microCoordinate - float2(0.41, 0.0)),
+                valueNoise(microCoordinate + float2(0.0, 0.41))
+                    - valueNoise(microCoordinate - float2(0.0, 0.41))
+            );
+            waterNormalXY += microNormal * 0.07;
+            waterNormalXY += float2(
+                ripple * 0.025,
+                (seepNoise - 0.5) * 0.05
+            );
+            waterNormalXY = clamp(waterNormalXY, -0.55, 0.55);
+            sourceUV += waterNormalXY
+                * refractionStrength
+                * wetMask
+                * (0.34 + waterThickness * 0.36);
+            sourceUV += paperFoldNormal
+                * (0.0011 + wrinkleProgress * 0.0014)
+                * wrinkleMask
+                * (1.0 - ruptureMask * 0.72);
         }
+
+        float combustibleMask = 1.0 - clamp(ruptureMask, 0.0, 1.0);
+        scorchBand *= combustibleMask;
+        pores *= combustibleMask;
+        keep *= 1.0 - pores * 0.82;
 
         float4 source = image.sample(imageSampler, clamp(sourceUV, 0.0, 1.0));
-        if (wetMask > 0.001) {
-            float blurRadius = (0.0025 + wetInfo.x * 0.0085) * wetMask;
-            float4 blurred = source;
-            blurred += image.sample(
+        if (absorptionMask > 0.001) {
+            float densityBlur = log2(1.0 + max(0.0, localFluidDensity));
+            float blurScale = 0.82 + densityBlur * 0.34;
+            float2 blurStep = float2(
+                backgroundBlurRadius / max(aspect, 0.001),
+                backgroundBlurRadius
+            ) * blurScale;
+            float3 blurredSource = source.rgb * 4.0;
+            blurredSource += image.sample(
                 imageSampler,
-                clamp(sourceUV + float2(blurRadius, 0.0), 0.0, 1.0)
-            );
-            blurred += image.sample(
+                clamp(sourceUV + float2(blurStep.x, 0.0), 0.0, 1.0)
+            ).rgb * 2.0;
+            blurredSource += image.sample(
                 imageSampler,
-                clamp(sourceUV - float2(blurRadius, 0.0), 0.0, 1.0)
-            );
-            blurred += image.sample(
+                clamp(sourceUV - float2(blurStep.x, 0.0), 0.0, 1.0)
+            ).rgb * 2.0;
+            blurredSource += image.sample(
                 imageSampler,
-                clamp(sourceUV + float2(0.0, blurRadius * 1.65), 0.0, 1.0)
-            );
-            blurred += image.sample(
+                clamp(sourceUV + float2(0.0, blurStep.y), 0.0, 1.0)
+            ).rgb * 2.0;
+            blurredSource += image.sample(
                 imageSampler,
-                clamp(sourceUV - float2(0.0, blurRadius * 0.72), 0.0, 1.0)
-            );
-            source = mix(source, blurred / 5.0, wetMask * 0.88);
-            float luminance = dot(source.rgb, float3(0.299, 0.587, 0.114));
+                clamp(sourceUV - float2(0.0, blurStep.y), 0.0, 1.0)
+            ).rgb * 2.0;
+            blurredSource += image.sample(
+                imageSampler,
+                clamp(sourceUV + blurStep, 0.0, 1.0)
+            ).rgb;
+            blurredSource += image.sample(
+                imageSampler,
+                clamp(sourceUV - blurStep, 0.0, 1.0)
+            ).rgb;
+            blurredSource += image.sample(
+                imageSampler,
+                clamp(sourceUV + float2(blurStep.x, -blurStep.y), 0.0, 1.0)
+            ).rgb;
+            blurredSource += image.sample(
+                imageSampler,
+                clamp(sourceUV + float2(-blurStep.x, blurStep.y), 0.0, 1.0)
+            ).rgb;
+            float2 halfBlurStep = blurStep * 0.5;
+            blurredSource += image.sample(
+                imageSampler,
+                clamp(sourceUV + float2(halfBlurStep.x, 0.0), 0.0, 1.0)
+            ).rgb * 2.0;
+            blurredSource += image.sample(
+                imageSampler,
+                clamp(sourceUV - float2(halfBlurStep.x, 0.0), 0.0, 1.0)
+            ).rgb * 2.0;
+            blurredSource += image.sample(
+                imageSampler,
+                clamp(sourceUV + float2(0.0, halfBlurStep.y), 0.0, 1.0)
+            ).rgb * 2.0;
+            blurredSource += image.sample(
+                imageSampler,
+                clamp(sourceUV - float2(0.0, halfBlurStep.y), 0.0, 1.0)
+            ).rgb * 2.0;
+            blurredSource /= 24.0;
             source.rgb = mix(
                 source.rgb,
-                mix(float3(luminance), float3(0.74, 0.67, 0.34), 0.24),
-                wetMask * 0.42
+                blurredSource,
+                clamp(
+                    absorptionMask
+                        * backgroundBlurStrength
+                        * (0.72 + densityBlur * 0.20),
+                    0.0,
+                    1.0
+                )
             );
-            source.rgb *= 1.0 - wetMask * 0.12;
+            source.rgb *= 1.0 - absorptionMask
+                * (0.07 + min(densityBlur * 0.018, 0.09));
         }
-        source.a *= insideMask * keep;
+        if (wetMask > 0.001) {
+            float2 dispersionOffset = waterNormalXY
+                * dispersionStrength
+                * wetMask;
+            float red = image.sample(
+                imageSampler,
+                clamp(sourceUV + dispersionOffset, 0.0, 1.0)
+            ).r;
+            float blue = image.sample(
+                imageSampler,
+                clamp(sourceUV - dispersionOffset, 0.0, 1.0)
+            ).b;
+            source.rgb = float3(red, source.g, blue);
 
-        float3 scorchedPaper = mix(
-            float3(0.19, 0.055, 0.012),
-            float3(0.012, 0.006, 0.004),
-            clamp(charCore * 0.92 + grain * 0.22, 0.0, 1.0)
-        );
-        source.rgb = mix(source.rgb, source.rgb * float3(0.72, 0.33, 0.12), heatStain * 0.48);
-        source.rgb = mix(source.rgb, scorchedPaper, charCore * (0.84 + grain * 0.15));
+            float3 waterNormal = normalize(float3(
+                -waterNormalXY.x * 2.7,
+                -waterNormalXY.y * 2.7,
+                1.0
+            ));
+            float3 lightDirection = normalize(float3(-0.42, -0.58, 0.70));
+            float3 halfVector = normalize(lightDirection + float3(0.0, 0.0, 1.0));
+            float specular = pow(max(dot(waterNormal, halfVector), 0.0), 30.0);
+            float reflectionBand = smoothstep(
+                0.78,
+                0.99,
+                sin(
+                    imageUV.y * 31.0
+                    - imageUV.x * 7.0
+                    + seedOffset.x
+                ) * 0.5 + 0.5
+            );
+            float2 reflectionUV = clamp(
+                sourceUV + float2(
+                    waterNormalXY.x * 0.034,
+                    -0.055 - waterNormalXY.y * 0.026
+                ),
+                0.0,
+                1.0
+            );
+            float3 reflected = image.sample(imageSampler, reflectionUV).rgb;
+            float fresnel = 0.08 + pow(1.0 - max(waterNormal.z, 0.0), 2.2);
+            float reflectionAmount = clamp(
+                wetMask * reflectionStrength * (0.20 + fresnel * 1.25)
+                    + dropletRim * 0.035,
+                0.0,
+                0.22
+            );
+            float3 reflectionTint = mix(
+                reflected,
+                float3(0.66, 0.80, 0.94),
+                0.10
+            );
+            source.rgb = mix(source.rgb, reflectionTint, reflectionAmount);
 
-        float ashCrust = insideMask
+            float3 urineTint = float3(0.93, 0.72, 0.19);
+            float3 absorbedEdgeTint = float3(0.57, 0.34, 0.055);
+            float visibleAbsorption = smoothstep(
+                0.015,
+                0.34,
+                absorptionMask
+            );
+            float visibleLiquid = smoothstep(
+                0.015,
+                0.24,
+                liquidMask
+            );
+            float tintAmount = clamp(
+                (
+                    visibleAbsorption * 0.24
+                    + visibleLiquid * 0.10
+                ) * urineTintStrength,
+                0.0,
+                0.30
+            );
+            source.rgb = mix(source.rgb, urineTint, tintAmount);
+            source.rgb.b *= 1.0 - tintAmount * 0.18;
+            float sourceLuminance = dot(
+                source.rgb,
+                float3(0.2126, 0.7152, 0.0722)
+            );
+            float darkSurfaceBoost = mix(
+                0.055,
+                0.018,
+                smoothstep(0.14, 0.72, sourceLuminance)
+            );
+            source.rgb += urineTint
+                * visibleLiquid
+                * urineTintStrength
+                * darkSurfaceBoost;
+            source.rgb += urineTint
+                * visibleAbsorption
+                * urineTintStrength
+                * 0.042;
+            float absorbedEdge = smoothstep(0.05, 0.34, absorptionMask)
+                * (1.0 - smoothstep(0.58, 0.94, absorptionMask));
+            source.rgb = mix(
+                source.rgb,
+                absorbedEdgeTint,
+                absorbedEdge * urineTintStrength * 0.22
+            );
+            source.rgb += urineTint * wetRim * 0.035;
+
+            float highlight = specular * wetMask * (0.055 + waterThickness * 0.08);
+            highlight += wetRim * (0.012 + reflectionBand * 0.025);
+            highlight += dropletHighlight * 0.07 + dropletRim * 0.012;
+            source.rgb += float3(1.0, 0.88, 0.42)
+                * highlight
+                * highlightIntensity;
+            source.rgb *= 1.0 - wetMask * 0.02;
+            float4 softReflection = image.sample(
+                imageSampler,
+                clamp(reflectionUV + waterNormalXY * 0.006, 0.0, 1.0)
+            );
+            source.rgb = mix(
+                source.rgb,
+                softReflection.rgb,
+                waterThickness * wetMask * 0.008
+            );
+        }
+        if (wrinkleMask > 0.001) {
+            source.rgb *= 1.0 + paperFoldLighting * 0.22;
+            source.rgb += float3(0.90, 0.83, 0.64)
+                * max(paperFoldLighting, 0.0)
+                * 0.070;
+            source.rgb *= 1.0 - max(-paperFoldLighting, 0.0) * 0.26;
+            source.rgb += float3(0.76, 0.70, 0.56)
+                * wrinkleRidge
+                * wrinkleMask
+                * 0.032;
+        }
+        if (tornEdge > 0.001 || ruptureMask > 0.001) {
+            float3 soakedFiber = float3(0.24, 0.12, 0.028);
+            float3 raisedFiber = float3(0.68, 0.52, 0.24);
+            float3 revealedBackground = backdrop.sample(
+                imageSampler,
+                clamp(imageUV, 0.0, 1.0)
+            ).rgb;
+            source.rgb = mix(source.rgb, raisedFiber, tornLip * 0.68);
+            source.rgb = mix(source.rgb, soakedFiber, tornShadow * 0.84);
+            source.rgb = mix(source.rgb, revealedBackground, ruptureMask);
+            source.a = max(source.a, ruptureMask);
+        }
+        float burnedResidue = insideMask
             * step(signedDistance, 0.0)
-            * smoothstep(-charWidth * 0.58, -0.002, signedDistance)
-            * (0.35 + grain * 0.65);
-        float effectMask = mix(horizontalMask, insideMask, radialMode);
-        float emberOuter = effectMask
-            * smoothstep(charWidth * 0.62, 0.0, abs(signedDistance));
-        float emberCore = effectMask * smoothstep(0.024, 0.0, abs(signedDistance));
+            * residualCharOpacity
+            * combustibleMask
+            * (0.42 + grain * 0.58);
+        source.a *= insideMask * max(keep, burnedResidue);
+
+        float localEffectCoverage = max(
+            max(absorptionMask, liquidMask),
+            max(dropletMask, max(ruptureMask, tornEdge))
+        );
+        float localOverlayCoverage = smoothstep(
+            0.004,
+            0.055,
+            localEffectCoverage
+        );
+        float preserveNativeWindow = soakMode
+            * (1.0 - step(1.5, wetInfo.y));
+        source.a *= mix(1.0, localOverlayCoverage, preserveNativeWindow);
+
+        float3 toastedSource = source.rgb * float3(0.50, 0.16, 0.035);
+        float3 edgeSoot = mix(
+            float3(0.16, 0.025, 0.004),
+            float3(0.018, 0.006, 0.002),
+            grain
+        );
+        source.rgb = mix(source.rgb, toastedSource, scorchBand * 0.46);
+        source.rgb = mix(source.rgb, edgeSoot, scorchBand * scorchBand * 0.64);
+
+        float effectMask = mix(horizontalMask, insideMask, radialMode)
+            * combustibleMask;
+        float edgeDistance = abs(signedDistance);
+        float burnedDistance = max(0.0, -signedDistance);
+        float edgeFlicker = 0.58 + 0.42 * valueNoise(float2(
+            imageUV.x * 127.0 + seedOffset.y,
+            time * 17.0 + seedOffset.x
+        ));
+        float hotCore = effectMask
+            * (1.0 - smoothstep(0.0, hotCoreWidth, edgeDistance))
+            * edgeFlicker;
+        float emberEdge = effectMask
+            * (1.0 - smoothstep(hotCoreWidth * 0.42, emberWidth, edgeDistance))
+            * (0.76 + edgeFlicker * 0.24);
+        float glow = effectMask
+            * (1.0 - smoothstep(emberWidth * 0.48, glowWidth, edgeDistance));
+        float tornEdgeArrival = tornEdge
+            * (1.0 - smoothstep(hotCoreWidth * 0.45, glowWidth * 1.35, edgeDistance));
+        hotCore = max(hotCore, tornEdgeArrival * edgeFlicker * 0.82);
+        emberEdge = max(emberEdge, tornEdgeArrival * 0.74);
+        glow = max(glow, tornEdgeArrival * 0.52);
 
         float flameMotion = fbm(float2(
-            imageUV.x * (10.0 + turbulence * 2.0) + seedOffset.x,
-            time * 4.6 + seedOffset.y
+            imageUV.x * (8.0 + turbulence * 2.8) + time * 0.42 + seedOffset.x,
+            imageUV.y * 2.7 - time * 2.9 + seedOffset.y
         ));
-        float flameDetail = valueNoise(float2(
-            imageUV.x * 57.0 + seedOffset.y,
-            time * 7.4 + seedOffset.x
+        float flameDetail = fbm(
+            imageUV * float2(31.0, 12.0)
+            + float2(seedOffset.y - time * 0.75, seedOffset.x - time * 4.1)
+        );
+        float broadLicks = valueNoise(float2(
+            imageUV.x * 13.0 - time * 0.38 + seedOffset.y,
+            time * 0.72 + seedOffset.x
         ));
-        float flameReach = 0.075 + coarse * 0.10 + flameMotion * 0.095;
-        float flame = effectMask
+        float fineLicks = valueNoise(float2(
+            imageUV.x * 39.0 + time * 0.21 + seedOffset.x,
+            time * 1.27 + seedOffset.y
+        ));
+        float lickHeight = pow(
+            clamp(broadLicks * 0.72 + fineLicks * 0.38, 0.0, 1.0),
+            1.65
+        );
+        float flameReach = maximumFlameReach
+            * (0.16 + lickHeight * 0.84)
+            * (0.82 + flameMotion * 0.31);
+        float flameEnvelope = effectMask
             * step(signedDistance, 0.0)
-            * smoothstep(-flameReach, -0.005, signedDistance);
-        flame *= 0.38 + flameDetail * 0.62;
-
-        float heat = clamp(1.0 - abs(signedDistance) * 27.0, 0.0, 1.0);
-        float3 emberColor = mix(
-            float3(0.50, 0.018, 0.003),
-            float3(1.0, 0.87, 0.11),
-            heat
+            * (1.0 - smoothstep(hotCoreWidth * 0.65, flameReach, burnedDistance));
+        float flameBreakup = smoothstep(
+            0.25,
+            0.73,
+            flameDetail + flameMotion * 0.28
         );
-        float3 flameColor = mix(
-            float3(0.46, 0.012, 0.002),
-            float3(1.0, 0.34, 0.008),
-            clamp(1.0 + signedDistance / max(flameReach, 0.001), 0.0, 1.0)
+        float breakupMix = smoothstep(emberWidth, flameReach, burnedDistance);
+        float flame = flameEnvelope
+            * mix(1.0, 0.44 + flameBreakup * 0.56, breakupMix);
+        float flamePhase = clamp(burnedDistance / max(flameReach, 0.001), 0.0, 1.0);
+
+        float3 deepRed = float3(0.72, 0.006, 0.001);
+        float3 orange = float3(1.0, 0.16, 0.002);
+        float3 gold = float3(1.0, 0.68, 0.055);
+        float3 hotWhite = float3(1.0, 0.96, 0.72);
+        float3 flameColor = mix(deepRed, orange, 1.0 - flamePhase);
+        flameColor = mix(
+            flameColor,
+            gold,
+            pow(1.0 - flamePhase, 2.4)
         );
 
-        float sparkCell = floor(imageUV.x * 64.0);
+        float sparkCell = floor(imageUV.x * 92.0);
         float sparkSeed = hash21(float2(sparkCell + seedOffset.x, 9.7 + seedOffset.y));
-        float sparkX = (sparkCell + sparkSeed) / 64.0;
-        float sparkTravel = fmod(time * (0.31 + sparkSeed * 0.47) + sparkSeed, 0.43);
-        float sparkY = front - 0.025 - sparkTravel;
-        float2 sparkDelta = float2((imageUV.x - sparkX) * aspect, imageUV.y - sparkY);
+        float sparkDrift = hash21(float2(sparkCell + seedOffset.y, 31.4));
+        float sparkX = (sparkCell + sparkSeed) / 92.0;
+        float sparkTravel = fmod(
+            time * (0.24 + sparkSeed * 0.38) + sparkSeed * 0.73,
+            0.48
+        );
+        sparkX += (sparkDrift - 0.5) * sparkTravel * 0.12;
+        float sparkY = front - 0.018 - sparkTravel;
+        float2 sparkDelta = float2(
+            (imageUV.x - sparkX) * aspect,
+            imageUV.y - sparkY
+        );
+        float sparkHead = 1.0 - smoothstep(0.0012, 0.0065, length(sparkDelta));
+        float sparkTrail = 1.0 - smoothstep(
+            0.0015,
+            0.0072,
+            length(float2(sparkDelta.x, sparkDelta.y * 0.38))
+        );
+        float sparkFlicker = 0.55 + 0.45 * sin(time * 31.0 + sparkSeed * 63.0);
         float spark = horizontalMask
             * (1.0 - radialMode)
-            * step(0.66, sparkSeed)
-            * smoothstep(0.010, 0.0015, length(sparkDelta));
+            * step(1.0 - sparkDensity, sparkSeed)
+            * max(sparkHead, sparkTrail * 0.28)
+            * sparkFlicker;
 
-        float ashCell = floor(imageUV.x * 43.0);
-        float ashSeed = hash21(float2(ashCell + seedOffset.y, 23.1 + seedOffset.x));
-        float ashX = (ashCell + ashSeed) / 43.0;
-        float ashTravel = fmod(time * (0.12 + ashSeed * 0.22) + ashSeed * 0.7, 0.36);
-        float ashY = front - 0.05 - ashTravel;
-        float2 ashDelta = float2((imageUV.x - ashX) * aspect, imageUV.y - ashY);
-        float ashFleck = horizontalMask
-            * (1.0 - radialMode)
-            * step(0.61, ashSeed)
-            * smoothstep(0.014, 0.003, length(ashDelta));
+        if (radialMode > 0.5 && ignitionCount > 0) {
+            float maximumRadius = length(float2(aspect, 1.0)) + 0.12;
+            for (uint index = 0; index < ignitionCount; index++) {
+                float4 ignition = ignitions[index];
+                float age = max(0.0, time - ignition.z);
+                float ignitionProgress = clamp(age / burnDuration, 0.0, 1.0);
+                float radius = ignitionProgress * maximumRadius;
+                for (uint particle = 0; particle < 3; particle++) {
+                    float particleSeed = hash21(float2(
+                        ignition.w + float(particle) * 19.13,
+                        7.1 + float(particle) * 5.7
+                    ));
+                    float driftSeed = hash21(float2(
+                        ignition.w * 0.37,
+                        float(particle) * 13.7 + 2.3
+                    ));
+                    float particleAge = fmod(
+                        age * (0.31 + particleSeed * 0.31) + particleSeed * 0.61,
+                        0.54
+                    );
+                    float angle = particleSeed * 6.2831853;
+                    float2 particlePosition = ignition.xy + float2(
+                        cos(angle) / aspect,
+                        sin(angle)
+                    ) * max(0.0, radius - emberWidth * 0.45);
+                    particlePosition.x += (driftSeed - 0.5) * particleAge * 0.12;
+                    particlePosition.y -= particleAge * (0.22 + particleSeed * 0.34);
+                    float2 particleDelta = float2(
+                        (imageUV.x - particlePosition.x) * aspect,
+                        imageUV.y - particlePosition.y
+                    );
+                    float particleHead = 1.0 - smoothstep(
+                        0.0013,
+                        0.007,
+                        length(particleDelta)
+                    );
+                    float particleTrail = 1.0 - smoothstep(
+                        0.0018,
+                        0.009,
+                        length(float2(particleDelta.x, particleDelta.y * 0.25))
+                    );
+                    float active = step(0.02, age)
+                        * step(1.0 - sparkDensity, driftSeed);
+                    spark = max(
+                        spark,
+                        insideMask
+                            * combustibleMask
+                            * active
+                            * max(particleHead, particleTrail * 0.42)
+                    );
+                }
+            }
+        }
 
-        float smokeDistance = -signedDistance;
         float smoke = effectMask
-            * step(0.03, smokeDistance)
-            * smoothstep(0.34, 0.055, smokeDistance)
-            * (0.12 + 0.22 * fbm(float2(
+            * step(emberWidth, burnedDistance)
+            * (1.0 - smoothstep(glowWidth, maximumFlameReach * 2.15, burnedDistance))
+            * (0.045 + 0.10 * fbm(float2(
                 imageUV.x * 5.0 + time * 0.25 + seedOffset.x,
-                imageUV.y * 4.0 + seedOffset.y
+                imageUV.y * 4.0 - time * 0.34 + seedOffset.y
             )));
 
-        float fireAlpha = max(emberOuter * 0.80, max(emberCore, flame * 0.90));
-        float3 fireRGB = emberColor * (emberOuter * 0.82 + emberCore * 1.45)
-            + flameColor * flame * 1.20;
-        float debrisAlpha = max(ashCrust * 0.88, ashFleck * 0.72);
-        float outputAlpha = max(source.a, max(fireAlpha, max(spark, max(smoke, debrisAlpha))));
+        float fireAlpha = max(
+            glow * 0.32,
+            max(emberEdge * 0.78, max(hotCore, flame * 0.92))
+        );
+        float3 fireRGB = float3(0.98, 0.055, 0.002) * glow * 0.48
+            + orange * emberEdge * 1.05
+            + flameColor * flame * 1.58
+            + hotWhite * hotCore * 1.95;
+        float outputAlpha = max(source.a, max(fireAlpha, max(spark, smoke)));
         float3 outputRGB = source.rgb * source.a
             + fireRGB
-            + float3(1.0, 0.46, 0.05) * spark * 2.2
-            + float3(0.12, 0.085, 0.055) * ashCrust * 0.72
-            + float3(0.055, 0.045, 0.040) * ashFleck * 0.80
-            + float3(0.12, 0.105, 0.105) * smoke;
+            + float3(1.0, 0.48, 0.045) * spark * 2.20
+            + float3(0.10, 0.075, 0.068) * smoke;
 
         outputRGB = outputAlpha > 0.0 ? outputRGB / outputAlpha : 0.0;
         return float4(outputRGB, outputAlpha);

@@ -21,9 +21,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key>
@@ -37,6 +37,6 @@
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2026 Alex Malikov. All rights reserved.</string>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>Window Burn captures a window once so it can animate that snapshot while the real window closes.</string>
+    <string>Window Burn captures the selected window and the content behind it so it can render the effect.</string>
 </dict>
 </plist>

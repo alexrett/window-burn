@@ -14,7 +14,8 @@ let package = Package(
     .executableTarget(
       name: "WindowBurn",
       dependencies: ["WindowBurnCore"],
-      resources: [.process("Resources")],
+      exclude: ["Resources/dog-cursor.png"],
+      resources: [.copy("Resources/torch-base.png")],
       linkerSettings: [
         .linkedFramework("AppKit"),
         .linkedFramework("ApplicationServices"),

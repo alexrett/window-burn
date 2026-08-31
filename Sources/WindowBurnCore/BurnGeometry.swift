@@ -46,6 +46,37 @@ public enum InteractiveRenderSizing {
   }
 }
 
+public enum BackdropCaptureGeometry {
+  public static func displayIndex(
+    containingMostOf windowFrame: CGRect,
+    among displayFrames: [CGRect]
+  ) -> Int? {
+    var bestIndex: Int?
+    var largestArea: CGFloat = 0
+    for (index, displayFrame) in displayFrames.enumerated() {
+      let intersection = windowFrame.intersection(displayFrame)
+      let area = intersection.isNull ? 0 : intersection.width * intersection.height
+      if area > largestArea {
+        bestIndex = index
+        largestArea = area
+      }
+    }
+    return bestIndex
+  }
+
+  public static func sourceRect(
+    for windowFrame: CGRect,
+    in displayFrame: CGRect
+  ) -> CGRect {
+    CGRect(
+      x: windowFrame.minX - displayFrame.minX,
+      y: windowFrame.minY - displayFrame.minY,
+      width: windowFrame.width,
+      height: windowFrame.height
+    )
+  }
+}
+
 public enum ScreenCoordinateConverter {
   public static func appKitPoint(
     forQuartzPoint point: CGPoint,

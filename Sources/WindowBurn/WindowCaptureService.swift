@@ -5,12 +5,14 @@ import WindowBurnCore
 
 struct CapturedWindow {
   let image: CGImage
+  let backdropImage: CGImage
   let captureFrame: CGRect
 }
 
 enum WindowCaptureError: LocalizedError {
   case permissionMissing
   case noMatchingWindow
+  case noMatchingDisplay
 
   var errorDescription: String? {
     switch self {
@@ -18,6 +20,8 @@ enum WindowCaptureError: LocalizedError {
       "Screen Recording permission is missing. Grant it in System Settings, restart Window Burn, and retry."
     case .noMatchingWindow:
       "ScreenCaptureKit could not match the focused window."
+    case .noMatchingDisplay:
+      "ScreenCaptureKit could not match the focused window to a display."
     }
   }
 }
@@ -71,6 +75,40 @@ enum WindowCaptureService {
       contentFilter: filter,
       configuration: configuration
     )
-    return CapturedWindow(image: image, captureFrame: window.frame)
+
+    let displayFrames = content.displays.map(\.frame)
+    guard
+      let displayIndex = BackdropCaptureGeometry.displayIndex(
+        containingMostOf: window.frame,
+        among: displayFrames
+      )
+    else {
+      throw WindowCaptureError.noMatchingDisplay
+    }
+    let display = content.displays[displayIndex]
+    let backdropFilter = SCContentFilter(display: display, excludingWindows: [window])
+    let backdropConfiguration = SCStreamConfiguration()
+    backdropConfiguration.width = pixelSize.width
+    backdropConfiguration.height = pixelSize.height
+    backdropConfiguration.sourceRect = BackdropCaptureGeometry.sourceRect(
+      for: window.frame,
+      in: display.frame
+    )
+    backdropConfiguration.showsCursor = false
+    backdropConfiguration.scalesToFit = true
+    backdropConfiguration.preservesAspectRatio = true
+
+    logger.info(
+      "Capturing the same rect from display \(display.displayID) with target window \(window.windowID) excluded"
+    )
+    let backdropImage = try await SCScreenshotManager.captureImage(
+      contentFilter: backdropFilter,
+      configuration: backdropConfiguration
+    )
+    return CapturedWindow(
+      image: image,
+      backdropImage: backdropImage,
+      captureFrame: window.frame
+    )
   }
 }

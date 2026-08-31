@@ -36,8 +36,6 @@ BUILD_BINARY="$(
 )/$PROCESS_NAME"
 
 cp "$BUILD_BINARY" "$APP_BUNDLE/Contents/MacOS/$PROCESS_NAME"
-cp "$ROOT_DIR/Sources/WindowBurn/Resources/dog-cursor.png" \
-    "$APP_BUNDLE/Contents/Resources/dog-cursor.png"
 cp "$ROOT_DIR/Sources/WindowBurn/Resources/torch-base.png" \
     "$APP_BUNDLE/Contents/Resources/torch-base.png"
 cp "$ROOT_DIR/Support/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"

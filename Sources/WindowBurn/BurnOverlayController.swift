@@ -10,18 +10,25 @@ enum BurnOverlayError: LocalizedError {
   }
 }
 
+enum BurnOverlayPresentation {
+  case effectOverlay
+  case demoWindow
+}
+
 @MainActor
 final class BurnOverlayController {
   static let padding: CGFloat = 84
 
-  private var panel: NSPanel?
+  private var window: NSWindow?
   private var renderer: BurnRenderer?
 
   func present(
     image: CGImage,
+    backdropImage: CGImage? = nil,
     panelFrame: CGRect,
     profile: BurnProfile,
     style: BurnRendererStyle = .sweep,
+    presentation: BurnOverlayPresentation = .effectOverlay,
     onFirstFrame: (() throws -> Void)?,
     completion: (() -> Void)? = nil
   ) throws {
@@ -31,24 +38,41 @@ final class BurnOverlayController {
       throw BurnOverlayError.metalUnavailable
     }
 
-    let window = NSPanel(
-      contentRect: panelFrame,
-      styleMask: [.borderless, .nonactivatingPanel],
-      backing: .buffered,
-      defer: false
-    )
-    window.backgroundColor = .clear
-    window.isOpaque = false
-    window.hasShadow = false
-    window.ignoresMouseEvents = true
-    window.level = .screenSaver
-    window.collectionBehavior = [
-      .canJoinAllSpaces,
-      .fullScreenAuxiliary,
-      .ignoresCycle,
-      .stationary,
-    ]
-
+    let window: NSWindow
+    switch presentation {
+    case .effectOverlay:
+      let panel = NSPanel(
+        contentRect: panelFrame,
+        styleMask: [.borderless, .nonactivatingPanel],
+        backing: .buffered,
+        defer: false
+      )
+      panel.backgroundColor = .clear
+      panel.isOpaque = false
+      panel.hasShadow = false
+      panel.ignoresMouseEvents = true
+      panel.level = .screenSaver
+      panel.collectionBehavior = [
+        .canJoinAllSpaces,
+        .fullScreenAuxiliary,
+        .ignoresCycle,
+        .stationary,
+      ]
+      window = panel
+    case .demoWindow:
+      let demoWindow = NSWindow(
+        contentRect: panelFrame,
+        styleMask: [.titled, .closable, .miniaturizable],
+        backing: .buffered,
+        defer: false
+      )
+      demoWindow.title = "Window Burn Shader Demo"
+      demoWindow.backgroundColor = .clear
+      demoWindow.isOpaque = false
+      demoWindow.hasShadow = true
+      demoWindow.isReleasedWhenClosed = false
+      window = demoWindow
+    }
     let metalView = MTKView(frame: CGRect(origin: .zero, size: panelFrame.size), device: device)
     metalView.autoresizingMask = [.width, .height]
     metalView.colorPixelFormat = .bgra8Unorm
@@ -56,13 +80,7 @@ final class BurnOverlayController {
     metalView.isPaused = true
     metalView.enableSetNeedsDisplay = true
     if case .soakAndBurn = style {
-      let pixelSize = InteractiveRenderSizing.pixelSize(
-        for: panelFrame.size,
-        pointPixelScale: window.backingScaleFactor,
-        maximumPixelCount: 2_000_000
-      )
       metalView.autoResizeDrawable = false
-      metalView.drawableSize = CGSize(width: pixelSize.width, height: pixelSize.height)
       metalView.preferredFramesPerSecond = 30
     } else {
       metalView.preferredFramesPerSecond = 60
@@ -73,21 +91,39 @@ final class BurnOverlayController {
     let burnRenderer = try BurnRenderer(
       device: device,
       image: image,
+      backdropImage: backdropImage,
       profile: profile,
       style: style,
-      horizontalPadding: Float(Self.padding / panelFrame.width),
-      verticalPadding: Float(Self.padding / panelFrame.height),
+      horizontalPadding: presentation == .demoWindow ? 0 : Float(Self.padding / panelFrame.width),
+      verticalPadding: presentation == .demoWindow ? 0 : Float(Self.padding / panelFrame.height),
       completion: { [weak self] in
         self?.dismiss()
         completion?()
       }
     )
     metalView.delegate = burnRenderer
+
+    if case .soakAndBurn = style {
+      let pointPixelScale = window.screen?.backingScaleFactor ?? window.backingScaleFactor
+      let pixelSize = InteractiveRenderSizing.pixelSize(
+        for: metalView.bounds.size,
+        pointPixelScale: pointPixelScale,
+        maximumPixelCount: 2_000_000
+      )
+      metalView.layer?.contentsScale = pointPixelScale
+      metalView.drawableSize = CGSize(width: pixelSize.width, height: pixelSize.height)
+    }
     window.contentView = metalView
 
-    panel = window
+    self.window = window
     renderer = burnRenderer
-    window.orderFrontRegardless()
+    switch presentation {
+    case .effectOverlay:
+      window.orderFrontRegardless()
+    case .demoWindow:
+      NSApp.activate(ignoringOtherApps: true)
+      window.makeKeyAndOrderFront(nil)
+    }
 
     metalView.draw()
     do {
@@ -123,8 +159,8 @@ final class BurnOverlayController {
   }
 
   func dismiss() {
-    panel?.orderOut(nil)
-    panel = nil
+    window?.orderOut(nil)
+    window = nil
     renderer = nil
   }
 }

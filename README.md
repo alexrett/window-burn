@@ -66,7 +66,7 @@ Restart Window Burn after changing any of the three permissions.
 | --- | --- | --- |
 | Burn & Close | `⌃⌥⌘B` | Closes the front window and burns its snapshot from a randomized edge. |
 | Torch | `⌃⌥⌘F` | Turns the cursor into an animated torch. Click a window, then add up to eight ignition points. |
-| Soak & Burn | `⌃⌥⌘U` | Hold and drag the dog over a window to soak it, then click again with the torch to ignite it. |
+| Soak & Burn | `⌃⌥⌘U` | Hold and drag the 18+ badge over a window to soak and tear it, then ignite the remaining edges with the torch. |
 | Test Effect | Menu bar | Plays a harmless demo without closing a real window. |
 
 Clicking a standard red close button is intercepted automatically. The yellow minimize button is
@@ -74,7 +74,7 @@ left alone so it keeps the native Dock animation.
 
 ## How it works
 
-1. ScreenCaptureKit captures the target window into memory.
+1. ScreenCaptureKit captures the target window and, for the soak effect, the same screen area with that window excluded.
 2. Accessibility asks the real application to close it. Standard unsaved-document alerts are
    resolved with their destructive action.
 3. A click-through Metal overlay renders the captured pixels, animated fire, ash, wetness, and

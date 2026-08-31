@@ -3,14 +3,14 @@ import WindowBurnCore
 
 enum EffectCursorStyle: Equatable {
   case torch
-  case dog(isSoaking: Bool)
+  case adultBadge(isSoaking: Bool)
 
   var size: CGSize {
     switch self {
     case .torch:
       CGSize(width: 60, height: 84)
-    case .dog:
-      CGSize(width: 136, height: 100)
+    case .adultBadge:
+      CGSize(width: 76, height: 118)
     }
   }
 
@@ -18,8 +18,8 @@ enum EffectCursorStyle: Equatable {
     switch self {
     case .torch:
       CGPoint(x: 30, y: 61)
-    case .dog:
-      CGPoint(x: 116, y: 5)
+    case .adultBadge:
+      CGPoint(x: 38, y: 83)
     }
   }
 }
@@ -181,7 +181,6 @@ final class TorchCursorController {
 }
 
 private final class EffectCursorView: NSView {
-  private lazy var dogImage = Self.resourceImage(named: "dog-cursor")
   private lazy var torchImage = Self.resourceImage(named: "torch-base")
 
   var style: EffectCursorStyle = .torch {
@@ -198,8 +197,8 @@ private final class EffectCursorView: NSView {
     switch style {
     case .torch:
       drawTorch(in: context)
-    case .dog(let isSoaking):
-      drawDog(isSoaking: isSoaking, in: context)
+    case .adultBadge(let isSoaking):
+      drawAdultBadge(isSoaking: isSoaking, in: context)
     }
   }
 
@@ -293,34 +292,59 @@ private final class EffectCursorView: NSView {
     context.restoreGraphicsState()
   }
 
-  private func drawDog(isSoaking: Bool, in context: NSGraphicsContext) {
-    let bob = isSoaking ? CGFloat(sin(animationTime * 13) * 1.1) : 0
-    dogImage?.draw(
-      in: CGRect(x: 2, y: 13 + bob, width: 126, height: 84),
-      from: .zero,
-      operation: .sourceOver,
-      fraction: 1,
-      respectFlipped: true,
-      hints: [.interpolation: NSImageInterpolation.high]
+  private func drawAdultBadge(isSoaking: Bool, in context: NSGraphicsContext) {
+    let pulse = isSoaking ? CGFloat((sin(animationTime * 12) + 1) * 0.5) : 0
+    context.saveGraphicsState()
+
+    let glow = NSShadow()
+    glow.shadowColor = NSColor.systemYellow.withAlphaComponent(0.18 + pulse * 0.22)
+    glow.shadowBlurRadius = 6 + pulse * 5
+    glow.shadowOffset = .zero
+    glow.set()
+
+    let badgeRect = CGRect(x: 11, y: 56, width: 54, height: 54)
+    let badge = NSBezierPath(ovalIn: badgeRect)
+    NSColor(calibratedWhite: 0.055, alpha: 0.96).setFill()
+    badge.fill()
+    NSColor(calibratedRed: 1.0, green: 0.72, blue: 0.08, alpha: 0.98).setStroke()
+    badge.lineWidth = 3
+    badge.stroke()
+
+    let label = NSString(string: "18+")
+    let attributes: [NSAttributedString.Key: Any] = [
+      .font: NSFont.systemFont(ofSize: 18, weight: .black),
+      .foregroundColor: NSColor.white,
+      .kern: -0.7,
+    ]
+    let labelSize = label.size(withAttributes: attributes)
+    label.draw(
+      at: CGPoint(
+        x: badgeRect.midX - labelSize.width / 2,
+        y: badgeRect.midY - labelSize.height / 2 + 1
+      ),
+      withAttributes: attributes
     )
 
-    guard isSoaking else { return }
-    context.saveGraphicsState()
-    let pulse = CGFloat(sin(animationTime * 16) * 2.2)
+    guard isSoaking else {
+      context.restoreGraphicsState()
+      return
+    }
+
+    let streamWave = CGFloat(sin(animationTime * 16) * 1.6)
     let stream = NSBezierPath()
-    stream.move(to: CGPoint(x: 52, y: 39 + bob))
+    stream.move(to: CGPoint(x: 38, y: 57))
     stream.curve(
-      to: CGPoint(x: 116, y: 5),
-      controlPoint1: CGPoint(x: 73, y: 35 + pulse),
-      controlPoint2: CGPoint(x: 103, y: 13 - pulse)
+      to: CGPoint(x: 38, y: 6),
+      controlPoint1: CGPoint(x: 36 + streamWave, y: 42),
+      controlPoint2: CGPoint(x: 40 - streamWave, y: 18)
     )
-    stream.lineWidth = 4.4
+    stream.lineWidth = 4.2
     stream.lineCapStyle = .round
-    NSColor(calibratedRed: 0.99, green: 0.80, blue: 0.11, alpha: 0.92).setStroke()
+    NSColor(calibratedRed: 1.0, green: 0.76, blue: 0.08, alpha: 0.96).setStroke()
     stream.stroke()
 
-    let splash = NSBezierPath(ovalIn: CGRect(x: 109, y: 1, width: 15, height: 5.5))
-    NSColor(calibratedRed: 1, green: 0.87, blue: 0.24, alpha: 0.70).setFill()
+    let splash = NSBezierPath(ovalIn: CGRect(x: 31.5, y: 2, width: 13, height: 5))
+    NSColor(calibratedRed: 1, green: 0.82, blue: 0.16, alpha: 0.72).setFill()
     splash.fill()
     context.restoreGraphicsState()
   }

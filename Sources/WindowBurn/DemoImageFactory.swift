@@ -34,6 +34,10 @@ enum DemoImageFactory {
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = graphicsContext
     defer { NSGraphicsContext.restoreGraphicsState() }
+    graphicsContext.cgContext.scaleBy(
+      x: CGFloat(bitmap.pixelsWide) / size.width,
+      y: CGFloat(bitmap.pixelsHigh) / size.height
+    )
 
     let bounds = CGRect(origin: .zero, size: size)
     let path = NSBezierPath(

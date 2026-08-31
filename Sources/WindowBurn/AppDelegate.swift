@@ -31,9 +31,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       self?.disableInteractiveModesAfterCloseFailure()
     }
     let isDemoLaunch = CommandLine.arguments.contains("--demo")
+    let isSoakDemoLaunch = CommandLine.arguments.contains("--demo-soak")
     let isTorchLaunch = CommandLine.arguments.contains("--torch")
     let isSoakAndBurnLaunch = CommandLine.arguments.contains("--soak-and-burn")
-    if !isDemoLaunch {
+    if !isDemoLaunch, !isSoakDemoLaunch {
       PermissionService.requestMissingPermissions()
       installWindowControlInterceptor()
     }
@@ -43,6 +44,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     if isDemoLaunch {
       DispatchQueue.main.async { [weak self] in
         self?.coordinator.showDemo()
+      }
+    } else if isSoakDemoLaunch {
+      DispatchQueue.main.async { [weak self] in
+        self?.coordinator.showSoakDemo()
       }
     } else if isTorchLaunch {
       DispatchQueue.main.async { [weak self] in
@@ -56,6 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationWillTerminate(_ notification: Notification) {
+    coordinator.cancelSoakAndBurn()
     torchCursor.setEnabled(false)
     burnHotKey = nil
     torchHotKey = nil
@@ -295,9 +301,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     switch phase {
     case .readyToSoak:
-      torchCursor.setStyle(.dog(isSoaking: false))
+      torchCursor.setStyle(.adultBadge(isSoaking: false))
     case .soaking:
-      torchCursor.setStyle(.dog(isSoaking: true))
+      torchCursor.setStyle(.adultBadge(isSoaking: true))
     case .readyToBurn:
       torchCursor.setStyle(.torch)
     case .burning:
