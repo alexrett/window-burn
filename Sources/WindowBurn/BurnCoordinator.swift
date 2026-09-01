@@ -3,13 +3,27 @@ import OSLog
 import WindowBurnCore
 
 @MainActor
+private final class TorchWindowSession {
+  let accessibleWindow: AccessibleWindow
+  let overlay = BurnOverlayController()
+  var captureFrame: CGRect
+  var pendingClicks: [CGPoint]
+  var isOverlayReady = false
+
+  init(accessibleWindow: AccessibleWindow, initialClick: CGPoint) {
+    self.accessibleWindow = accessibleWindow
+    captureFrame = accessibleWindow.target.frame
+    pendingClicks = [initialClick]
+  }
+}
+
+@MainActor
 final class BurnCoordinator {
   private let logger = Logger(subsystem: "dev.malikov.WindowBurn", category: "burn")
   private let overlay = BurnOverlayController()
   private var isBusy = false
-  private var torchCaptureFrame: CGRect?
-  private var pendingTorchClicks: [CGPoint] = []
-  private var isTorchOverlayActive = false
+  private var torchSessionRegistry = TorchWindowSessionRegistry()
+  private var torchSessions: [UUID: TorchWindowSession] = [:]
   private var soakAndBurnSession = SoakAndBurnSession()
   private var soakedWindow: AccessibleWindow?
   private var soakCaptureFrame: CGRect?
@@ -23,7 +37,7 @@ final class BurnCoordinator {
   var onDestructiveCloseFailure: (() -> Void)?
 
   func burnFrontWindow() {
-    guard !isBusy else { return }
+    guard !isBusy, torchSessions.isEmpty else { return }
     isBusy = true
 
     Task { @MainActor [weak self] in
@@ -70,7 +84,7 @@ final class BurnCoordinator {
   }
 
   func interceptWindowControl(_ control: AccessibleWindowControl) -> Bool {
-    guard !isBusy else { return false }
+    guard !isBusy, torchSessions.isEmpty else { return false }
     isBusy = true
 
     Task { @MainActor [weak self] in
@@ -131,26 +145,34 @@ final class BurnCoordinator {
   }
 
   func interceptTorchClick(at screenPoint: CGPoint) -> Bool {
-    if let captureFrame = torchCaptureFrame,
+    if let sessionID = torchSessionRegistry.sessionID(containing: screenPoint),
+      let session = torchSessions[sessionID],
       let ignition = TorchBurnGeometry.normalizedIgnition(
         screenPoint: screenPoint,
-        captureFrame: captureFrame
+        captureFrame: session.captureFrame
       )
     {
-      if isTorchOverlayActive {
-        let added = overlay.addIgnition(ignition)
+      if session.isOverlayReady {
+        let added = session.overlay.addIgnition(ignition)
         if added {
           logger.info(
-            "Added another torch ignition at \(ignition.x, format: .fixed(precision: 2)), \(ignition.y, format: .fixed(precision: 2))"
+            "Added another torch ignition to session \(sessionID.uuidString, privacy: .public) at \(ignition.x, format: .fixed(precision: 2)), \(ignition.y, format: .fixed(precision: 2))"
           )
         } else {
           logger.info(
-            "Ignored torch ignition because the active window already has the maximum number of points"
+            "Ignored torch ignition because session \(sessionID.uuidString, privacy: .public) already has the maximum number of points"
           )
         }
-      } else if pendingTorchClicks.count < TorchIgnitionField.maximumCount {
-        pendingTorchClicks.append(screenPoint)
+      } else if session.pendingClicks.count < TorchIgnitionField.maximumCount {
+        session.pendingClicks.append(screenPoint)
       }
+      return true
+    }
+
+    if torchSessionRegistry.isAtCapacity {
+      logger.info(
+        "Ignored torch ignition because \(TorchWindowSessionRegistry.maximumConcurrentWindows) window sessions are already active"
+      )
       return true
     }
 
@@ -165,24 +187,35 @@ final class BurnCoordinator {
       return false
     }
 
-    isBusy = true
-    torchCaptureFrame = accessibleWindow.target.frame
-    pendingTorchClicks = [screenPoint]
-    isTorchOverlayActive = false
+    let sessionID = UUID()
+    guard
+      torchSessionRegistry.register(
+        id: sessionID,
+        captureFrame: accessibleWindow.target.frame
+      )
+    else {
+      return true
+    }
+    torchSessions[sessionID] = TorchWindowSession(
+      accessibleWindow: accessibleWindow,
+      initialClick: screenPoint
+    )
 
     Task { @MainActor [weak self] in
       guard let self else { return }
 
       do {
+        guard let session = torchSessions[sessionID] else { return }
         let capturedWindow = try await WindowCaptureService.capture(
-          target: accessibleWindow.target
+          target: session.accessibleWindow.target
         )
+        guard let session = torchSessions[sessionID] else { return }
         let panelFrame = ScreenCoordinateConverter.appKitFrame(
           for: capturedWindow.captureFrame,
           mainDisplayHeight: NSScreen.screens.first?.frame.maxY ?? 0,
           padding: BurnOverlayController.padding
         )
-        let ignitionPoints = pendingTorchClicks.compactMap {
+        let ignitionPoints = session.pendingClicks.compactMap {
           TorchBurnGeometry.normalizedIgnition(
             screenPoint: $0,
             captureFrame: capturedWindow.captureFrame
@@ -192,9 +225,17 @@ final class BurnCoordinator {
           throw WindowCaptureError.noMatchingWindow
         }
 
-        torchCaptureFrame = capturedWindow.captureFrame
+        session.captureFrame = capturedWindow.captureFrame
+        guard
+          torchSessionRegistry.updateCaptureFrame(
+            id: sessionID,
+            captureFrame: capturedWindow.captureFrame
+          )
+        else {
+          throw WindowCaptureError.noMatchingWindow
+        }
         let profile = BurnProfile.randomTorch()
-        try overlay.present(
+        try session.overlay.present(
           image: capturedWindow.image,
           shadowImage: capturedWindow.shadowImage,
           shadowSamplingOffset: capturedWindow.shadowSamplingOffset,
@@ -204,23 +245,31 @@ final class BurnCoordinator {
           startImmediately: false,
           onFirstFrame: nil,
           completion: { [weak self] in
-            self?.finishTorchBurn()
+            self?.finishTorchBurn(sessionID)
           }
         )
-        try await AccessibilityWindowService.closeDiscardingUnsavedChanges(accessibleWindow)
-        guard overlay.activateReplacementSurface() else {
+        session.isOverlayReady = true
+        session.pendingClicks = []
+        try await AccessibilityWindowService.closeDiscardingUnsavedChanges(
+          session.accessibleWindow
+        )
+        guard
+          torchSessions[sessionID] != nil,
+          session.overlay.activateReplacementSurface()
+        else {
           throw BurnOverlayError.rendererUnavailable
         }
-        overlay.startBurning()
-        isTorchOverlayActive = true
+        session.overlay.startBurning()
         logger.info(
-          "Started torch burn for pid \(accessibleWindow.target.ownerPID) with \(ignitionPoints.count) ignition point(s), duration \(profile.duration, format: .fixed(precision: 2))s"
+          "Started torch session \(sessionID.uuidString, privacy: .public) for pid \(session.accessibleWindow.target.ownerPID) with \(ignitionPoints.count) ignition point(s), duration \(profile.duration, format: .fixed(precision: 2))s; \(self.torchSessionRegistry.count) concurrent window(s)"
         )
       } catch {
-        overlay.dismiss()
-        finishTorchBurn()
+        torchSessions[sessionID]?.overlay.dismiss()
+        finishTorchBurn(sessionID)
         onDestructiveCloseFailure?()
-        logger.error("Torch burn failed: \(error.localizedDescription, privacy: .public)")
+        logger.error(
+          "Torch session \(sessionID.uuidString, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+        )
         showError(error)
       }
     }
@@ -271,7 +320,7 @@ final class BurnCoordinator {
   }
 
   func showDemo() {
-    guard !isBusy else { return }
+    guard !isBusy, torchSessions.isEmpty else { return }
     isBusy = true
     logger.info("Starting demo burn")
 
@@ -307,7 +356,7 @@ final class BurnCoordinator {
   }
 
   func showSoakDemo() {
-    guard !isBusy else { return }
+    guard !isBusy, torchSessions.isEmpty else { return }
     isBusy = true
     logger.info("Starting soak-and-burn demo")
 
@@ -376,17 +425,18 @@ final class BurnCoordinator {
     }
   }
 
-  private func finishTorchBurn() {
-    isBusy = false
-    torchCaptureFrame = nil
-    pendingTorchClicks = []
-    isTorchOverlayActive = false
-    logger.info("Torch burn completed")
+  private func finishTorchBurn(_ sessionID: UUID) {
+    guard torchSessions.removeValue(forKey: sessionID) != nil else { return }
+    torchSessionRegistry.remove(id: sessionID)
+    logger.info(
+      "Torch session \(sessionID.uuidString, privacy: .public) completed; \(self.torchSessionRegistry.count) concurrent window(s) remain"
+    )
   }
 
   private func beginSoaking(at screenPoint: CGPoint) -> Bool {
     guard
       !isBusy,
+      torchSessions.isEmpty,
       let accessibleWindow = AccessibilityWindowService.window(at: screenPoint),
       TorchBurnGeometry.normalizedIgnition(
         screenPoint: screenPoint,

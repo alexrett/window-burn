@@ -42,6 +42,62 @@ public struct TorchIgnitionField: Equatable, Sendable {
   }
 }
 
+public struct TorchWindowSessionRegistry: Equatable, Sendable {
+  public static let maximumConcurrentWindows = 4
+
+  private struct Entry: Equatable, Sendable {
+    let id: UUID
+    var captureFrame: CGRect
+  }
+
+  private var entries: [Entry] = []
+
+  public init() {}
+
+  public var count: Int {
+    entries.count
+  }
+
+  public var isAtCapacity: Bool {
+    count >= Self.maximumConcurrentWindows
+  }
+
+  @discardableResult
+  public mutating func register(id: UUID, captureFrame: CGRect) -> Bool {
+    guard
+      !isAtCapacity,
+      !entries.contains(where: { $0.id == id }),
+      captureFrame.width > 1,
+      captureFrame.height > 1
+    else {
+      return false
+    }
+    entries.append(Entry(id: id, captureFrame: captureFrame))
+    return true
+  }
+
+  @discardableResult
+  public mutating func updateCaptureFrame(id: UUID, captureFrame: CGRect) -> Bool {
+    guard
+      captureFrame.width > 1,
+      captureFrame.height > 1,
+      let index = entries.firstIndex(where: { $0.id == id })
+    else {
+      return false
+    }
+    entries[index].captureFrame = captureFrame
+    return true
+  }
+
+  public func sessionID(containing screenPoint: CGPoint) -> UUID? {
+    entries.last(where: { $0.captureFrame.contains(screenPoint) })?.id
+  }
+
+  public mutating func remove(id: UUID) {
+    entries.removeAll(where: { $0.id == id })
+  }
+}
+
 public enum TorchBurnGeometry {
   public static func normalizedIgnition(
     screenPoint: CGPoint,

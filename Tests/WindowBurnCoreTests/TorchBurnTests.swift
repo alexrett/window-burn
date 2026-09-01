@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 import Testing
 
 @testable import WindowBurnCore
@@ -51,5 +52,73 @@ struct TorchBurnTests {
     #expect(field.ignitions.count == TorchIgnitionField.maximumCount)
     #expect(field.ignitions.first?.startedAt == 0)
     #expect(field.ignitions.last?.startedAt == Double(TorchIgnitionField.maximumCount - 1))
+  }
+
+  @Test("Routes an overlapping click to the most recently ignited window")
+  func routesClickToMostRecentWindow() throws {
+    let olderWindow = UUID()
+    let newerWindow = UUID()
+    var registry = TorchWindowSessionRegistry()
+
+    let registeredOlderWindow = registry.register(
+      id: olderWindow,
+      captureFrame: CGRect(x: 100, y: 100, width: 500, height: 400)
+    )
+    let registeredNewerWindow = registry.register(
+      id: newerWindow,
+      captureFrame: CGRect(x: 300, y: 200, width: 500, height: 400)
+    )
+    #expect(registeredOlderWindow)
+    #expect(registeredNewerWindow)
+
+    let match = try #require(
+      registry.sessionID(containing: CGPoint(x: 350, y: 250))
+    )
+    #expect(match == newerWindow)
+  }
+
+  @Test("Completing one torch window leaves the other sessions active")
+  func removesOnlyCompletedWindow() {
+    let firstWindow = UUID()
+    let secondWindow = UUID()
+    var registry = TorchWindowSessionRegistry()
+    let firstFrame = CGRect(x: 100, y: 100, width: 300, height: 250)
+    let secondFrame = CGRect(x: 500, y: 100, width: 300, height: 250)
+
+    let registeredFirstWindow = registry.register(id: firstWindow, captureFrame: firstFrame)
+    let registeredSecondWindow = registry.register(id: secondWindow, captureFrame: secondFrame)
+    #expect(registeredFirstWindow)
+    #expect(registeredSecondWindow)
+
+    registry.remove(id: firstWindow)
+
+    #expect(registry.count == 1)
+    #expect(registry.sessionID(containing: firstFrame.center) == nil)
+    #expect(registry.sessionID(containing: secondFrame.center) == secondWindow)
+  }
+
+  @Test("Bounds the number of simultaneously burning windows")
+  func boundsConcurrentWindowCount() {
+    var registry = TorchWindowSessionRegistry()
+
+    for index in 0..<TorchWindowSessionRegistry.maximumConcurrentWindows {
+      let registered = registry.register(
+        id: UUID(),
+        captureFrame: CGRect(x: CGFloat(index * 120), y: 0, width: 100, height: 100)
+      )
+      #expect(registered)
+    }
+
+    let registeredOverflowWindow = registry.register(
+      id: UUID(),
+      captureFrame: CGRect(x: 900, y: 0, width: 100, height: 100)
+    )
+    #expect(!registeredOverflowWindow)
+  }
+}
+
+extension CGRect {
+  fileprivate var center: CGPoint {
+    CGPoint(x: midX, y: midY)
   }
 }
