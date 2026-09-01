@@ -74,6 +74,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   private var lastDrawTime: CFTimeInterval?
   private var soakEndedAt: TimeInterval?
   private var burnStartedAt: TimeInterval?
+  private var isHandoffPrepared = false
+  private var shouldSynchronizeNextFrame = false
   private var hasCompleted = false
 
   init(
@@ -195,9 +197,22 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   }
 
   func start() {
+    guard startTime == nil else { return }
     let now = CACurrentMediaTime()
     startTime = now
     lastDrawTime = now
+  }
+
+  func synchronizeNextFrame() {
+    shouldSynchronizeNextFrame = true
+  }
+
+  @discardableResult
+  func prepareForIgnitionHandoff() -> Bool {
+    guard case .soakAndBurn = style, burnStartedAt == nil else { return false }
+    isHandoffPrepared = true
+    shouldSynchronizeNextFrame = true
+    return true
   }
 
   @discardableResult
@@ -229,6 +244,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     if soakEndedAt == nil {
       soakEndedAt = elapsed
     }
+    isHandoffPrepared = false
     burnStartedAt = elapsed
     ignitionField.add(point: point, startedAt: elapsed)
     return true
@@ -308,7 +324,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     let hasWetContent = wetDepositQueue.totalPointCount > 0
     var wetInfo = SIMD4<Float>(
       hasWetContent ? SoakEffect.wetness(heldFor: soakingDuration) : 0,
-      burnStartedAt == nil ? (soakEndedAt == nil ? 0 : 1) : 2,
+      burnStartedAt == nil && !isHandoffPrepared ? (soakEndedAt == nil ? 0 : 1) : 2,
       hasWetContent ? SoakEffect.amount(heldFor: soakingDuration) : 0,
       hasWetContent ? 1 : 0
     )
@@ -448,6 +464,10 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     encoder.endEncoding()
     commandBuffer.present(drawable)
     commandBuffer.commit()
+    if shouldSynchronizeNextFrame {
+      commandBuffer.waitUntilCompleted()
+      shouldSynchronizeNextFrame = false
+    }
 
     let canComplete: Bool = {
       if case .soakAndBurn = style { return burnStartedAt != nil }
@@ -2058,12 +2078,36 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             + orange * emberEdge * 1.05
             + flameColor * flame * 1.58
             + hotWhite * hotCore * 1.95;
-        float outputAlpha = max(source.a, max(fireAlpha, max(spark, max(smoke, steam))));
+        float2 outsideDelta = max(
+            max(-imageUV, imageUV - 1.0),
+            float2(0.0)
+        );
+        float outsideDistance = length(outsideDelta * float2(aspect, 1.0));
+        float exterior = 1.0 - insideMask;
+        float handoffVisibility = 1.0 - preserveNativeWindow;
+        float survivingExterior = smoothstep(0.08, 0.72, keep);
+        float exteriorShadow = exterior
+            * (1.0 - smoothstep(0.006, 0.065, outsideDistance))
+            * survivingExterior
+            * handoffVisibility
+            * 0.30;
+        float exteriorRim = exterior
+            * (1.0 - smoothstep(0.0, 0.0045, outsideDistance))
+            * survivingExterior
+            * handoffVisibility
+            * 0.18;
+        float exteriorDepth = max(exteriorShadow, exteriorRim);
+        float outputAlpha = max(
+            source.a,
+            max(exteriorDepth, max(fireAlpha, max(spark, max(smoke, steam))))
+        );
         float3 outputRGB = source.rgb * source.a
             + fireRGB
             + float3(1.0, 0.48, 0.045) * spark * 2.20
             + float3(0.10, 0.075, 0.068) * smoke
-            + float3(0.80, 0.88, 0.92) * steam * 1.18;
+            + float3(0.80, 0.88, 0.92) * steam * 1.18
+            + float3(0.012, 0.010, 0.009) * exteriorShadow
+            + float3(0.20, 0.17, 0.13) * exteriorRim;
 
         outputRGB = outputAlpha > 0.0 ? outputRGB / outputAlpha : 0.0;
         return float4(outputRGB, outputAlpha);

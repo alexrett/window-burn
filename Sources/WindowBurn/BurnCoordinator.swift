@@ -41,18 +41,21 @@ final class BurnCoordinator {
         )
         let profile = BurnProfile.random()
 
-        try await AccessibilityWindowService.closeDiscardingUnsavedChanges(accessibleWindow)
         try overlay.present(
           image: capturedWindow.image,
           panelFrame: panelFrame,
           profile: profile,
+          startImmediately: false,
           onFirstFrame: nil,
           completion: { [weak self] in self?.isBusy = false }
         )
+        try await AccessibilityWindowService.closeDiscardingUnsavedChanges(accessibleWindow)
+        overlay.startBurning()
         logger.info(
           "Burning front window owned by pid \(accessibleWindow.target.ownerPID), duration \(profile.duration, format: .fixed(precision: 2))s"
         )
       } catch {
+        overlay.dismiss()
         isBusy = false
         onDestructiveCloseFailure?()
         logger.error("Burn failed: \(error.localizedDescription, privacy: .public)")
@@ -80,19 +83,22 @@ final class BurnCoordinator {
         )
         let profile = BurnProfile.random()
 
-        actionPerformed = true
-        try await AccessibilityWindowService.closeDiscardingUnsavedChanges(control.window)
         try overlay.present(
           image: capturedWindow.image,
           panelFrame: panelFrame,
           profile: profile,
+          startImmediately: false,
           onFirstFrame: nil,
           completion: { [weak self] in self?.isBusy = false }
         )
+        actionPerformed = true
+        try await AccessibilityWindowService.closeDiscardingUnsavedChanges(control.window)
+        overlay.startBurning()
         logger.info(
           "Burning intercepted \(control.kind.logName, privacy: .public) action for pid \(control.window.target.ownerPID), duration \(profile.duration, format: .fixed(precision: 2))s"
         )
       } catch {
+        overlay.dismiss()
         if !actionPerformed {
           do {
             try AccessibilityWindowService.perform(control)
@@ -178,22 +184,25 @@ final class BurnCoordinator {
 
         torchCaptureFrame = capturedWindow.captureFrame
         let profile = BurnProfile.randomTorch()
-        try await AccessibilityWindowService.closeDiscardingUnsavedChanges(accessibleWindow)
         try overlay.present(
           image: capturedWindow.image,
           panelFrame: panelFrame,
           profile: profile,
           style: .torch(initialIgnitions: ignitionPoints),
+          startImmediately: false,
           onFirstFrame: nil,
           completion: { [weak self] in
             self?.finishTorchBurn()
           }
         )
+        try await AccessibilityWindowService.closeDiscardingUnsavedChanges(accessibleWindow)
+        overlay.startBurning()
         isTorchOverlayActive = true
         logger.info(
           "Started torch burn for pid \(accessibleWindow.target.ownerPID) with \(ignitionPoints.count) ignition point(s), duration \(profile.duration, format: .fixed(precision: 2))s"
         )
       } catch {
+        overlay.dismiss()
         finishTorchBurn()
         onDestructiveCloseFailure?()
         logger.error("Torch burn failed: \(error.localizedDescription, privacy: .public)")
@@ -469,6 +478,11 @@ final class BurnCoordinator {
     soakCloseTask = Task { @MainActor [weak self] in
       guard let self else { return }
       do {
+        guard overlay.prepareForIgnitionHandoff() else {
+          overlay.dismiss()
+          resetSoakAndBurn()
+          return
+        }
         try await AccessibilityWindowService.closeDiscardingUnsavedChanges(accessibleWindow)
         guard generation == soakGeneration, !Task.isCancelled else { return }
         soakCloseTask = nil

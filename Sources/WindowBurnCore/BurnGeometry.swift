@@ -105,3 +105,21 @@ public enum BurnTiming {
     return min(1, max(0, elapsed / duration))
   }
 }
+
+public enum OverlayDepthModel {
+  public static func exteriorShadowOpacity(
+    outsideDistance: Float,
+    materialVisibility: Float,
+    isNativeWindowVisible: Bool
+  ) -> Float {
+    guard !isNativeWindowVisible else { return 0 }
+    let distanceFade = 1 - smoothstep(0.006, 0.065, max(0, outsideDistance))
+    let survivingMaterial = smoothstep(0.08, 0.72, materialVisibility)
+    return distanceFade * survivingMaterial * 0.30
+  }
+
+  private static func smoothstep(_ edge0: Float, _ edge1: Float, _ value: Float) -> Float {
+    let normalized = min(1, max(0, (value - edge0) / (edge1 - edge0)))
+    return normalized * normalized * (3 - 2 * normalized)
+  }
+}

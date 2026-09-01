@@ -20,6 +20,7 @@ final class BurnOverlayController {
   static let padding: CGFloat = 84
 
   private var window: NSWindow?
+  private var metalView: MTKView?
   private var renderer: BurnRenderer?
 
   func present(
@@ -29,6 +30,7 @@ final class BurnOverlayController {
     profile: BurnProfile,
     style: BurnRendererStyle = .sweep,
     presentation: BurnOverlayPresentation = .effectOverlay,
+    startImmediately: Bool = true,
     onFirstFrame: (() throws -> Void)?,
     completion: (() -> Void)? = nil
   ) throws {
@@ -116,6 +118,7 @@ final class BurnOverlayController {
     window.contentView = metalView
 
     self.window = window
+    self.metalView = metalView
     renderer = burnRenderer
     switch presentation {
     case .effectOverlay:
@@ -125,6 +128,7 @@ final class BurnOverlayController {
       window.makeKeyAndOrderFront(nil)
     }
 
+    burnRenderer.synchronizeNextFrame()
     metalView.draw()
     do {
       try onFirstFrame?()
@@ -133,9 +137,29 @@ final class BurnOverlayController {
       throw error
     }
 
+    if startImmediately {
+      startBurning()
+    }
+  }
+
+  func startBurning() {
+    guard let metalView, let renderer else { return }
+    renderer.start()
     metalView.enableSetNeedsDisplay = false
     metalView.isPaused = false
-    burnRenderer.start()
+  }
+
+  @discardableResult
+  func prepareForIgnitionHandoff() -> Bool {
+    guard
+      let metalView,
+      let renderer,
+      renderer.prepareForIgnitionHandoff()
+    else {
+      return false
+    }
+    metalView.draw()
+    return true
   }
 
   @discardableResult
@@ -161,6 +185,7 @@ final class BurnOverlayController {
   func dismiss() {
     window?.orderOut(nil)
     window = nil
+    metalView = nil
     renderer = nil
   }
 }

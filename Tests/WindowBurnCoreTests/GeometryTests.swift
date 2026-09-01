@@ -40,6 +40,35 @@ struct GeometryTests {
 
     #expect(point == CGPoint(x: 320, y: 820))
   }
+
+  @Test("The overlay shadow separates only the surviving external silhouette")
+  func preservesWindowDepthDuringBurn() {
+    let visibleEdge = OverlayDepthModel.exteriorShadowOpacity(
+      outsideDistance: 0.012,
+      materialVisibility: 1,
+      isNativeWindowVisible: false
+    )
+    let nativeShadowStillVisible = OverlayDepthModel.exteriorShadowOpacity(
+      outsideDistance: 0.012,
+      materialVisibility: 1,
+      isNativeWindowVisible: true
+    )
+    let burnedEdge = OverlayDepthModel.exteriorShadowOpacity(
+      outsideDistance: 0.012,
+      materialVisibility: 0,
+      isNativeWindowVisible: false
+    )
+    let beyondShadow = OverlayDepthModel.exteriorShadowOpacity(
+      outsideDistance: 0.09,
+      materialVisibility: 1,
+      isNativeWindowVisible: false
+    )
+
+    #expect(visibleEdge > 0.15)
+    #expect(nativeShadowStillVisible == 0)
+    #expect(burnedEdge == 0)
+    #expect(beyondShadow == 0)
+  }
 }
 
 @Suite("Capture pixel sizing")
