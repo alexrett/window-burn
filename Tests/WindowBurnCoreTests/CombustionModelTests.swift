@@ -128,6 +128,29 @@ struct CombustionModelTests {
     #expect(response.fireVisibility > 0.9)
   }
 
+  @Test("Freshly ignited material does not darken before it is damaged")
+  func undamagedMaterialDoesNotScorch() {
+    let fresh = CombustionVisualModel.response(
+      depositedMoisture: 0.8,
+      remainingMoisture: 0.8,
+      heat: 1,
+      damage: 0,
+      progress: 0.1,
+      isRadial: true
+    )
+    let damaged = CombustionVisualModel.response(
+      depositedMoisture: 0.8,
+      remainingMoisture: 0.2,
+      heat: 1,
+      damage: 0.25,
+      progress: 0.3,
+      isRadial: true
+    )
+
+    #expect(fresh.scorchOpacity == 0)
+    #expect(damaged.scorchOpacity > fresh.scorchOpacity)
+  }
+
   @Test("Radial fire collapses before it can linger on a window edge")
   func radialFireHasNoTerminalTail() {
     let response = CombustionVisualModel.response(

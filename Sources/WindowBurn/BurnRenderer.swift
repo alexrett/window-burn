@@ -1052,13 +1052,6 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 nearestFront = min(nearestFront, length(delta) - radius + radialRagged);
             }
             signedDistance = nearestFront;
-        }
-        if (soakMode > 0.5 && ignitionCount > 0) {
-            float stateFrontNoise = valueNoise(
-                imageUV * float2(59.0, 43.0) + seedOffset * 9.1
-            ) - 0.5;
-            signedDistance = (0.48 - combustionDamage) * 0.086
-                + stateFrontNoise * 0.007;
         } else if (soakMode > 0.5) {
             signedDistance = 1000.0;
         }
@@ -1069,6 +1062,9 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             * step(0.0, signedDistance)
             * (1.0 - smoothstep(0.0, charWidth * 1.35, signedDistance));
         scorchBand *= 0.58 + grain * 0.42;
+        float stateScorch = smoothstep(0.06, 0.34, combustionDamage)
+            * (1.0 - smoothstep(0.72, 0.98, combustionDamage));
+        scorchBand *= mix(1.0, stateScorch, soakMode);
         float pores = scorchBand
             * smoothstep(0.74, 0.95, pinholeNoise + scorchBand * 0.18);
 
@@ -1100,12 +1096,6 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         radialEffectVisibility *= lateBorderSuppression;
         float stateKeep = 1.0 - smoothstep(0.50, 0.98, combustionDamage);
         keep = max(keep, stateKeep) * terminalMaterialVisibility;
-        float stateScorch = smoothstep(0.06, 0.34, combustionDamage)
-            * (1.0 - smoothstep(0.72, 0.98, combustionDamage));
-        scorchBand = max(
-            scorchBand,
-            stateScorch * insideMask * (0.62 + grain * 0.38)
-        );
         float2 sourceUV = imageUV;
         float wetMask = 0.0;
         float waterThickness = 0.0;
@@ -1828,8 +1818,6 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             * radialEffectVisibility;
         float edgeDistance = abs(signedDistance);
         float burnedDistance = max(0.0, -signedDistance);
-        float pixelSpan = max(fwidth(signedDistance), 0.00025);
-        hotCoreWidth = clamp(hotCoreWidth, pixelSpan * 1.5, pixelSpan * 5.0);
         float combustionActivity = smoothstep(0.10, 0.72, combustionHeat)
             * (1.0 - smoothstep(0.88, 1.0, combustionDamage));
         float moistureDamping = 1.0

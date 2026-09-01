@@ -104,17 +104,20 @@ public enum CombustionModel {
 public struct CombustionVisualResponse: Equatable, Sendable {
   public let fireVisibility: Float
   public let steamOpacity: Float
+  public let scorchOpacity: Float
   public let effectVisibility: Float
   public let materialVisibility: Float
 
   public init(
     fireVisibility: Float,
     steamOpacity: Float,
+    scorchOpacity: Float,
     effectVisibility: Float,
     materialVisibility: Float
   ) {
     self.fireVisibility = fireVisibility
     self.steamOpacity = steamOpacity
+    self.scorchOpacity = scorchOpacity
     self.effectVisibility = effectVisibility
     self.materialVisibility = materialVisibility
   }
@@ -148,6 +151,9 @@ public enum CombustionVisualModel {
         smoothstep(0.16, 0.76, remainingMoisture) * 0.75
       )
     let steamOpacity = min(0.62, boilingMoisture * 0.62)
+    let scorchOpacity =
+      smoothstep(0.06, 0.34, damage)
+      * (1 - smoothstep(0.72, 0.98, damage))
 
     let effectVisibility =
       isRadial
@@ -162,6 +168,7 @@ public enum CombustionVisualModel {
     return CombustionVisualResponse(
       fireVisibility: moistureDamping,
       steamOpacity: steamOpacity,
+      scorchOpacity: scorchOpacity,
       effectVisibility: effectVisibility,
       materialVisibility: undamagedMaterial * terminalMaterialVisibility
     )
