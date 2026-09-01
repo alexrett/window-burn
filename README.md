@@ -65,7 +65,7 @@ Restart Window Burn after changing any of the three permissions.
 | Mode | Shortcut | What it does |
 | --- | --- | --- |
 | Burn & Close | `⌃⌥⌘B` | Closes the front window and burns its snapshot from a randomized edge. |
-| Torch | `⌃⌥⌘F` | Turns the cursor into an animated torch. Click a window, then add up to eight ignition points. |
+| Torch | `⌃⌥⌘F` | Turns the cursor into an animated torch. Burn up to four windows at once, with up to eight ignition points per window. |
 | Soak & Burn | `⌃⌥⌘U` | Hold and drag the 18+ badge over a window to soak and tear it, then ignite the remaining edges with the torch. |
 | Test Effect | Menu bar | Plays a harmless demo without closing a real window. |
 
