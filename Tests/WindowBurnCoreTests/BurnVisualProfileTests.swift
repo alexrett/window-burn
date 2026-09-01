@@ -24,4 +24,14 @@ struct BurnVisualProfileTests {
     #expect(BurnVisualProfile.cinematic.sparkDensity >= 0.25)
     #expect(BurnVisualProfile.cinematic.sparkDensity <= 0.6)
   }
+
+  @Test("A radial burn breaks its circular silhouette at multiple scales")
+  func radialContourIsStructurallyIrregular() {
+    let profile = BurnVisualProfile.cinematic
+
+    #expect(profile.radialContourWarp >= 0.18)
+    #expect(profile.radialContourWarp <= 0.22)
+    #expect(profile.radialBiteDepth >= 0.07)
+    #expect(profile.radialBiteDepth < profile.radialContourWarp)
+  }
 }

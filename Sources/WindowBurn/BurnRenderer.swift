@@ -318,9 +318,11 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       visualProfile.glowWidth,
       visualProfile.flameReach
     )
-    var fireMaterial = SIMD2<Float>(
+    var fireMaterial = SIMD4<Float>(
       visualProfile.sparkDensity,
-      visualProfile.residualCharOpacity
+      visualProfile.residualCharOpacity,
+      visualProfile.radialContourWarp,
+      visualProfile.radialBiteDepth
     )
     var waterOptics = SIMD4<Float>(
       wetVisualProfile.refractionStrength,
@@ -419,7 +421,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     )
     encoder.setFragmentBytes(
       &fireMaterial,
-      length: MemoryLayout<SIMD2<Float>>.stride,
+      length: MemoryLayout<SIMD4<Float>>.stride,
       index: 9
     )
     encoder.setFragmentBytes(
@@ -589,6 +591,10 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       combustionProfile.heatRelease,
       combustionProfile.maximumHeat
     )
+    var edgeShape = SIMD2<Float>(
+      visualProfile.radialContourWarp,
+      visualProfile.radialBiteDepth
+    )
 
     stepEncoder.setComputePipelineState(stepCombustionPipeline)
     stepEncoder.setTexture(
@@ -606,6 +612,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     stepEncoder.setBytes(&fieldInfo, length: MemoryLayout<SIMD4<Float>>.stride, index: 3)
     stepEncoder.setBytes(&physics, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
     stepEncoder.setBytes(&dynamics, length: MemoryLayout<SIMD4<Float>>.stride, index: 5)
+    stepEncoder.setBytes(&edgeShape, length: MemoryLayout<SIMD2<Float>>.stride, index: 6)
     stepEncoder.dispatchThreads(
       MTLSize(
         width: combustionStateTextures[nextCombustionTextureIndex].width,
@@ -738,6 +745,40 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         return value;
     }
 
+    float radialEdgeOffset(
+        float2 uv,
+        float2 physicalDelta,
+        float ignitionProgress,
+        float ignitionSeed,
+        float turbulence,
+        float contourWarpStrength,
+        float biteDepth
+    ) {
+        float radialDistance = length(physicalDelta);
+        float2 radialDirection = physicalDelta / max(radialDistance, 0.0001);
+        float radialGrain = fbm(
+            uv * float2(13.0, 11.0)
+            + float2(ignitionSeed * 0.011, ignitionSeed * 0.019)
+        );
+        float radialFibers = valueNoise(
+            uv * float2(47.0, 39.0) + ignitionSeed * 0.007
+        );
+        float offset = (radialGrain - 0.5) * 0.13 * turbulence
+            + (radialFibers - 0.5) * 0.035;
+        float contourNoise = fbm(
+            radialDirection * 2.15
+            + float2(ignitionSeed * 0.023, ignitionSeed * 0.037)
+        );
+        float biteNoise = valueNoise(
+            radialDirection * 7.7
+            + float2(ignitionSeed * 0.041, ignitionSeed * 0.029)
+        );
+        float frontMaturity = smoothstep(0.05, 0.30, ignitionProgress);
+        float contourWarp = (contourNoise - 0.47) * contourWarpStrength;
+        float bite = pow(smoothstep(0.68, 0.91, biteNoise), 1.7) * biteDepth;
+        return offset + (contourWarp + bite) * frontMaturity;
+    }
+
     kernel void clearWetField(
         texture2d<float, access::write> wetField [[texture(0)]],
         uint2 position [[thread_position_in_grid]]
@@ -827,6 +868,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         constant float4 &fieldInfo [[buffer(3)]],
         constant float4 &physics [[buffer(4)]],
         constant float4 &dynamics [[buffer(5)]],
+        constant float2 &edgeShape [[buffer(6)]],
         uint2 position [[thread_position_in_grid]]
     ) {
         if (position.x >= nextState.get_width()
@@ -882,13 +924,23 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 float age = max(0.0, time - ignition.z);
                 float ignitionProgress = clamp(age / burnDuration, 0.0, 1.0);
                 float radius = ignitionProgress * maximumRadius;
-                float distance = length((uv - ignition.xy) * float2(aspect, 1.0));
-                float frontHeat = 1.0 - smoothstep(0.012, 0.060, abs(distance - radius));
-                float passedFront = 1.0 - smoothstep(
-                    max(0.0, radius - 0.065),
-                    radius,
-                    distance
+                float2 physicalDelta = (uv - ignition.xy) * float2(aspect, 1.0);
+                float frontDistance = length(physicalDelta) - radius
+                    + radialEdgeOffset(
+                        uv,
+                        physicalDelta,
+                        ignitionProgress,
+                        ignition.w,
+                        turbulence,
+                        edgeShape.x,
+                        edgeShape.y
+                    );
+                float frontHeat = 1.0 - smoothstep(
+                    0.012,
+                    0.060,
+                    abs(frontDistance)
                 );
+                float passedFront = 1.0 - smoothstep(-0.065, 0.0, frontDistance);
                 sourceHeat = max(
                     sourceHeat,
                     max(frontHeat, passedFront * 0.34 * (1.0 - state.a))
@@ -964,7 +1016,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         constant float4 *wetPoints [[buffer(6)]],
         constant float4 &wetInfo [[buffer(7)]],
         constant float4 &flameLayers [[buffer(8)]],
-        constant float2 &fireMaterial [[buffer(9)]],
+        constant float4 &fireMaterial [[buffer(9)]],
         constant float4 &waterOptics [[buffer(10)]],
         constant float4 &waterDetail [[buffer(11)]],
         constant float4 &waterGeometry [[buffer(12)]],
@@ -982,6 +1034,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         float maximumFlameReach = flameLayers.w;
         float sparkDensity = fireMaterial.x;
         float residualCharOpacity = fireMaterial.y;
+        float radialContourWarp = fireMaterial.z;
+        float radialBiteDepth = fireMaterial.w;
         float refractionStrength = waterOptics.x;
         float dispersionStrength = waterOptics.y;
         float reflectionStrength = waterOptics.z;
@@ -1038,18 +1092,18 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 float age = max(0.0, time - ignition.z);
                 float ignitionProgress = clamp(age / burnDuration, 0.0, 1.0);
                 float2 delta = (imageUV - ignition.xy) * float2(aspect, 1.0);
-                float radialGrain = fbm(
-                    imageUV * float2(13.0, 11.0)
-                    + float2(ignition.w * 0.011, ignition.w * 0.019)
+                float radialDistance = length(delta);
+                float radialRagged = radialEdgeOffset(
+                    imageUV,
+                    delta,
+                    ignitionProgress,
+                    ignition.w,
+                    turbulence,
+                    radialContourWarp,
+                    radialBiteDepth
                 );
-                float radialFibers = valueNoise(
-                    imageUV * float2(47.0, 39.0)
-                    + ignition.w * 0.007
-                );
-                float radialRagged = (radialGrain - 0.5) * 0.13 * turbulence
-                    + (radialFibers - 0.5) * 0.035;
                 float radius = ignitionProgress * maximumRadius;
-                nearestFront = min(nearestFront, length(delta) - radius + radialRagged);
+                nearestFront = min(nearestFront, radialDistance - radius + radialRagged);
             }
             signedDistance = nearestFront;
         } else if (soakMode > 0.5) {
@@ -1094,7 +1148,25 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             radialMode * smoothstep(0.48, 0.70, progress)
         );
         radialEffectVisibility *= lateBorderSuppression;
-        float stateKeep = 1.0 - smoothstep(0.50, 0.98, combustionDamage);
+        float damageContour = fbm(
+            imageUV * float2(6.8, 5.4) + seedOffset * 4.3
+        );
+        float damageFibers = valueNoise(
+            imageUV * float2(37.0, 29.0) + seedOffset * 9.7
+        );
+        float damageBreakup = (damageContour - 0.47)
+            * radialContourWarp * 3.0;
+        damageBreakup += (damageFibers - 0.5) * radialBiteDepth * 2.0;
+        float activeDamageEdge = smoothstep(0.10, 0.44, combustionDamage)
+            * (1.0 - smoothstep(0.84, 1.0, combustionDamage));
+        float fractureMaturity = radialMode * smoothstep(0.05, 0.30, progress);
+        float fracturedDamage = clamp(
+            combustionDamage
+                + damageBreakup * activeDamageEdge * fractureMaturity,
+            0.0,
+            1.0
+        );
+        float stateKeep = 1.0 - smoothstep(0.50, 0.98, fracturedDamage);
         keep = max(keep, stateKeep) * terminalMaterialVisibility;
         float2 sourceUV = imageUV;
         float wetMask = 0.0;
