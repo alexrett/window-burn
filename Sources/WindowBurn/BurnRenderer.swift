@@ -64,6 +64,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   private let style: BurnRendererStyle
   private let horizontalPadding: Float
   private let verticalPadding: Float
+  private let cornerRadius: Float
   private let completion: () -> Void
   private var ignitionField: TorchIgnitionField
   private var wetDepositQueue: WetDepositQueue
@@ -86,6 +87,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     style: BurnRendererStyle,
     horizontalPadding: Float,
     verticalPadding: Float,
+    cornerRadius: Float,
     completion: @escaping () -> Void
   ) throws {
     guard let commandQueue = device.makeCommandQueue() else {
@@ -99,6 +101,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     self.style = style
     self.horizontalPadding = horizontalPadding
     self.verticalPadding = verticalPadding
+    self.cornerRadius = cornerRadius
     self.completion = completion
     var ignitionField = TorchIgnitionField()
     if case .torch(let initialIgnitions) = style {
@@ -364,6 +367,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       wetVisualProfile.tearStartDensity,
       wetVisualProfile.tearFullDensity
     )
+    var windowCornerRadius = cornerRadius
     var wetUniforms =
       activeWetPoint.map { point in
         [SIMD4<Float>(point.x, point.y, profile.seed + 11.73, impactFade)]
@@ -459,6 +463,11 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       &wetPaperDamage,
       length: MemoryLayout<SIMD4<Float>>.stride,
       index: 13
+    )
+    encoder.setFragmentBytes(
+      &windowCornerRadius,
+      length: MemoryLayout<Float>.stride,
+      index: 14
     )
     encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
     encoder.endEncoding()
@@ -1040,7 +1049,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         constant float4 &waterOptics [[buffer(10)]],
         constant float4 &waterDetail [[buffer(11)]],
         constant float4 &waterGeometry [[buffer(12)]],
-        constant float4 &wetPaperDamage [[buffer(13)]]
+        constant float4 &wetPaperDamage [[buffer(13)]],
+        constant float &windowCornerRadius [[buffer(14)]]
     ) {
         float progress = timing.x;
         float time = timing.y;
@@ -1081,7 +1091,24 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         float2 imageUV = (input.uv - padding) / contentSize;
 
         float horizontalMask = step(0.0, imageUV.x) * step(imageUV.x, 1.0);
-        float insideMask = horizontalMask * step(0.0, imageUV.y) * step(imageUV.y, 1.0);
+        float rectangleMask = horizontalMask
+            * step(0.0, imageUV.y)
+            * step(imageUV.y, 1.0);
+        float capturedShape = image.sample(imageSampler, imageUV).a;
+        float insideMask = rectangleMask
+            * smoothstep(0.01, 0.99, capturedShape);
+        float contentAspect = aspect * contentSize.x / max(contentSize.y, 0.001);
+        float2 shapePosition = (imageUV - 0.5) * float2(contentAspect, 1.0);
+        float2 shapeHalfSize = float2(contentAspect * 0.5, 0.5);
+        float shapeRadius = min(
+            windowCornerRadius,
+            min(shapeHalfSize.x, shapeHalfSize.y)
+        );
+        float2 roundedDelta = abs(shapePosition)
+            - (shapeHalfSize - shapeRadius);
+        float roundedRectangleDistance = length(max(roundedDelta, 0.0))
+            + min(max(roundedDelta.x, roundedDelta.y), 0.0)
+            - shapeRadius;
         float4 combustion = combustionState.sample(
             imageSampler,
             clamp(imageUV, 0.0, 1.0)
@@ -1148,10 +1175,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             hotCoreWidth * 1.65,
             signedDistance + edgeBreakup
         );
-        float physicalBorderDistance = min(
-            min(imageUV.x, 1.0 - imageUV.x) * aspect,
-            min(imageUV.y, 1.0 - imageUV.y)
-        );
+        float physicalBorderDistance = -roundedRectangleDistance;
         float borderSuppression = mix(
             1.0,
             smoothstep(0.0, 0.085, physicalBorderDistance),
@@ -2078,12 +2102,13 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             + orange * emberEdge * 1.05
             + flameColor * flame * 1.58
             + hotWhite * hotCore * 1.95;
-        float2 outsideDelta = max(
-            max(-imageUV, imageUV - 1.0),
-            float2(0.0)
+        float outsideDistance = max(0.0, roundedRectangleDistance);
+        float shapeAntialias = max(fwidth(roundedRectangleDistance), 0.0005);
+        float exterior = smoothstep(
+            -shapeAntialias,
+            shapeAntialias,
+            roundedRectangleDistance
         );
-        float outsideDistance = length(outsideDelta * float2(aspect, 1.0));
-        float exterior = 1.0 - insideMask;
         float handoffVisibility = 1.0 - preserveNativeWindow;
         float survivingExterior = smoothstep(0.08, 0.72, keep);
         float exteriorShadow = exterior

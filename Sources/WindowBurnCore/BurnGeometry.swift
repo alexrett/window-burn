@@ -107,6 +107,30 @@ public enum BurnTiming {
 }
 
 public enum OverlayDepthModel {
+  public static func roundedRectangleSignedDistance(
+    x: Float,
+    y: Float,
+    aspect: Float,
+    cornerRadius: Float
+  ) -> Float {
+    let validAspect = max(0.001, aspect)
+    let radius = min(0.5, validAspect * 0.5, max(0, cornerRadius))
+    let distanceX = abs(x - 0.5) * validAspect - (validAspect * 0.5 - radius)
+    let distanceY = abs(y - 0.5) - (0.5 - radius)
+    let outsideX = max(0, distanceX)
+    let outsideY = max(0, distanceY)
+    let outside = sqrt(outsideX * outsideX + outsideY * outsideY)
+    let inside = min(max(distanceX, distanceY), 0)
+    return outside + inside - radius
+  }
+
+  public static func materialCoverage(
+    sourceAlpha: Float,
+    rectangleCoverage: Float
+  ) -> Float {
+    min(1, max(0, sourceAlpha)) * min(1, max(0, rectangleCoverage))
+  }
+
   public static func exteriorShadowOpacity(
     outsideDistance: Float,
     materialVisibility: Float,

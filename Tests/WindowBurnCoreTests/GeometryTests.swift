@@ -69,6 +69,27 @@ struct GeometryTests {
     #expect(burnedEdge == 0)
     #expect(beyondShadow == 0)
   }
+
+  @Test("Rounded window corners are outside the combustible silhouette")
+  func clipsRoundedWindowCorners() {
+    let topEdge = OverlayDepthModel.roundedRectangleSignedDistance(
+      x: 0.5,
+      y: 0,
+      aspect: 1.5,
+      cornerRadius: 0.025
+    )
+    let squareCorner = OverlayDepthModel.roundedRectangleSignedDistance(
+      x: 0,
+      y: 0,
+      aspect: 1.5,
+      cornerRadius: 0.025
+    )
+
+    #expect(abs(topEdge) < 0.001)
+    #expect(squareCorner > 0.005)
+    #expect(OverlayDepthModel.materialCoverage(sourceAlpha: 0, rectangleCoverage: 1) == 0)
+    #expect(OverlayDepthModel.materialCoverage(sourceAlpha: 1, rectangleCoverage: 1) == 1)
+  }
 }
 
 @Suite("Capture pixel sizing")

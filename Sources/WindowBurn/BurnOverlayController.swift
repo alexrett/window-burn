@@ -98,6 +98,9 @@ final class BurnOverlayController {
       style: style,
       horizontalPadding: presentation == .demoWindow ? 0 : Float(Self.padding / panelFrame.width),
       verticalPadding: presentation == .demoWindow ? 0 : Float(Self.padding / panelFrame.height),
+      cornerRadius: presentation == .demoWindow
+        ? 0
+        : Float(10 / max(1, panelFrame.height - Self.padding * 2)),
       completion: { [weak self] in
         self?.dismiss()
         completion?()
