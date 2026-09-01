@@ -1142,12 +1142,12 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             min(imageUV.x, 1.0 - imageUV.x) * aspect,
             min(imageUV.y, 1.0 - imageUV.y)
         );
-        float lateBorderSuppression = mix(
+        float borderSuppression = mix(
             1.0,
             smoothstep(0.0, 0.085, physicalBorderDistance),
-            radialMode * smoothstep(0.48, 0.70, progress)
+            radialMode
         );
-        radialEffectVisibility *= lateBorderSuppression;
+        radialEffectVisibility *= borderSuppression;
         float damageContour = fbm(
             imageUV * float2(6.8, 5.4) + seedOffset * 4.3
         );

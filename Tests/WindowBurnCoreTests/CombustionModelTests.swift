@@ -166,6 +166,36 @@ struct CombustionModelTests {
     #expect(response.materialVisibility < 0.01)
   }
 
+  @Test("Radial fire fades before rectangular clipping can create a straight seam")
+  func radialFireFadesAtPhysicalBorder() {
+    let atBorder = CombustionVisualModel.borderVisibility(
+      distanceToBorder: 0,
+      fadeWidth: 0.085,
+      isRadial: true
+    )
+    let approachingBorder = CombustionVisualModel.borderVisibility(
+      distanceToBorder: 0.03,
+      fadeWidth: 0.085,
+      isRadial: true
+    )
+    let safelyInside = CombustionVisualModel.borderVisibility(
+      distanceToBorder: 0.10,
+      fadeWidth: 0.085,
+      isRadial: true
+    )
+    let sweepAtBorder = CombustionVisualModel.borderVisibility(
+      distanceToBorder: 0,
+      fadeWidth: 0.085,
+      isRadial: false
+    )
+
+    #expect(atBorder == 0)
+    #expect(approachingBorder > atBorder)
+    #expect(approachingBorder < safelyInside)
+    #expect(safelyInside == 1)
+    #expect(sweepAtBorder == 1)
+  }
+
   @Test("Terminal fade leaves the active middle of a burn untouched")
   func terminalFadeStartsLate() {
     let response = CombustionVisualModel.response(

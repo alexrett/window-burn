@@ -128,6 +128,15 @@ public enum CombustionVisualModel {
     isRadial ? 0.82 : 1
   }
 
+  public static func borderVisibility(
+    distanceToBorder: Float,
+    fadeWidth: Float,
+    isRadial: Bool
+  ) -> Float {
+    guard isRadial else { return 1 }
+    return smoothstep(0, max(0.001, fadeWidth), max(0, distanceToBorder))
+  }
+
   public static func response(
     depositedMoisture: Float,
     remainingMoisture: Float,
