@@ -80,6 +80,10 @@ public enum CombustionModel {
       nextHeat * profile.evaporationRate * deltaTime
     )
     let nextMoisture = moisture - evaporatedMoisture
+    nextHeat = max(
+      0,
+      nextHeat - evaporatedMoisture * profile.moistureResistance * 0.85
+    )
     let combustibleHeat = max(
       0,
       nextHeat - profile.ignitionThreshold - nextMoisture * profile.moistureResistance
@@ -94,5 +98,81 @@ public enum CombustionModel {
       fuel: nextFuel,
       damage: max(damage, 1 - nextFuel)
     )
+  }
+}
+
+public struct CombustionVisualResponse: Equatable, Sendable {
+  public let fireVisibility: Float
+  public let steamOpacity: Float
+  public let effectVisibility: Float
+  public let materialVisibility: Float
+
+  public init(
+    fireVisibility: Float,
+    steamOpacity: Float,
+    effectVisibility: Float,
+    materialVisibility: Float
+  ) {
+    self.fireVisibility = fireVisibility
+    self.steamOpacity = steamOpacity
+    self.effectVisibility = effectVisibility
+    self.materialVisibility = materialVisibility
+  }
+}
+
+public enum CombustionVisualModel {
+  public static func completionProgress(isRadial: Bool) -> Float {
+    isRadial ? 0.82 : 1
+  }
+
+  public static func response(
+    depositedMoisture: Float,
+    remainingMoisture: Float,
+    heat: Float,
+    damage: Float,
+    progress: Float,
+    isRadial: Bool
+  ) -> CombustionVisualResponse {
+    let depositedMoisture = clamp(depositedMoisture)
+    let remainingMoisture = min(clamp(remainingMoisture), depositedMoisture)
+    let heat = max(0, heat)
+    let damage = clamp(damage)
+    let progress = clamp(progress)
+
+    let moistureDamping = 1 - smoothstep(0.08, 0.72, remainingMoisture) * 0.96
+    let evaporatedMoisture = max(0, depositedMoisture - remainingMoisture)
+    let boilingMoisture =
+      smoothstep(0.12, 0.78, heat)
+      * max(
+        smoothstep(0.02, 0.32, evaporatedMoisture),
+        smoothstep(0.16, 0.76, remainingMoisture) * 0.75
+      )
+    let steamOpacity = min(0.62, boilingMoisture * 0.62)
+
+    let effectVisibility =
+      isRadial
+      ? 1 - smoothstep(0.60, 0.82, progress)
+      : 1
+    let terminalMaterialVisibility =
+      isRadial
+      ? 1 - smoothstep(0.70, 0.82, progress)
+      : 1
+    let undamagedMaterial = 1 - smoothstep(0.50, 0.98, damage)
+
+    return CombustionVisualResponse(
+      fireVisibility: moistureDamping,
+      steamOpacity: steamOpacity,
+      effectVisibility: effectVisibility,
+      materialVisibility: undamagedMaterial * terminalMaterialVisibility
+    )
+  }
+
+  private static func clamp(_ value: Float) -> Float {
+    min(1, max(0, value))
+  }
+
+  private static func smoothstep(_ edge0: Float, _ edge1: Float, _ value: Float) -> Float {
+    let normalized = clamp((value - edge0) / (edge1 - edge0))
+    return normalized * normalized * (3 - 2 * normalized)
   }
 }

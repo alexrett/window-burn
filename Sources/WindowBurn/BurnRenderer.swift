@@ -451,7 +451,10 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       if case .soakAndBurn = style { return burnStartedAt != nil }
       return true
     }()
-    if canComplete, timing.x >= 1 {
+    let completionProgress = CombustionVisualModel.completionProgress(
+      isRadial: effectMode > 0.5
+    )
+    if canComplete, timing.x >= completionProgress {
       hasCompleted = true
       view.isPaused = true
       completion()
@@ -926,6 +929,10 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             nextHeat * evaporationRate * deltaTime
         );
         float nextMoisture = moisture - evaporatedMoisture;
+        nextHeat = max(
+            0.0,
+            nextHeat - evaporatedMoisture * moistureResistance * 0.85
+        );
         float combustibleHeat = max(
             0.0,
             nextHeat - ignitionThreshold - nextMoisture * moistureResistance
@@ -1045,6 +1052,13 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 nearestFront = min(nearestFront, length(delta) - radius + radialRagged);
             }
             signedDistance = nearestFront;
+        }
+        if (soakMode > 0.5 && ignitionCount > 0) {
+            float stateFrontNoise = valueNoise(
+                imageUV * float2(59.0, 43.0) + seedOffset * 9.1
+            ) - 0.5;
+            signedDistance = (0.48 - combustionDamage) * 0.086
+                + stateFrontNoise * 0.007;
         } else if (soakMode > 0.5) {
             signedDistance = 1000.0;
         }
@@ -1064,8 +1078,28 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             hotCoreWidth * 1.65,
             signedDistance + edgeBreakup
         );
+        float radialEffectVisibility = mix(
+            1.0,
+            1.0 - smoothstep(0.60, 0.82, progress),
+            radialMode
+        );
+        float terminalMaterialVisibility = mix(
+            1.0,
+            1.0 - smoothstep(0.70, 0.82, progress),
+            radialMode
+        );
+        float physicalBorderDistance = min(
+            min(imageUV.x, 1.0 - imageUV.x) * aspect,
+            min(imageUV.y, 1.0 - imageUV.y)
+        );
+        float lateBorderSuppression = mix(
+            1.0,
+            smoothstep(0.0, 0.085, physicalBorderDistance),
+            radialMode * smoothstep(0.48, 0.70, progress)
+        );
+        radialEffectVisibility *= lateBorderSuppression;
         float stateKeep = 1.0 - smoothstep(0.50, 0.98, combustionDamage);
-        keep = max(keep, stateKeep);
+        keep = max(keep, stateKeep) * terminalMaterialVisibility;
         float stateScorch = smoothstep(0.06, 0.34, combustionDamage)
             * (1.0 - smoothstep(0.72, 0.98, combustionDamage));
         scorchBand = max(
@@ -1093,6 +1127,9 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         float tornEdge = 0.0;
         float tornLip = 0.0;
         float tornShadow = 0.0;
+        float depositedMoisture = 0.0;
+        float steamSource = 0.0;
+        float steamPlume = 0.0;
         if (soakMode > 0.5 && wetInfo.w > 0.5) {
             float wetness = wetInfo.x;
             float fluidAmount = max(wetInfo.z, wetness);
@@ -1112,6 +1149,66 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 clamp(imageUV, 0.0, 1.0)
             ).r * insideMask;
             localFluidDensity = bakedDensity;
+            depositedMoisture = clamp(
+                log2(1.0 + max(0.0, bakedDensity)) * 0.32,
+                0.0,
+                1.0
+            );
+            float evaporatedMoisture = max(
+                0.0,
+                depositedMoisture - combustionMoisture
+            );
+            float boilingMoisture = smoothstep(0.12, 0.78, combustionHeat)
+                * max(
+                    smoothstep(0.02, 0.32, evaporatedMoisture),
+                    smoothstep(0.16, 0.76, combustionMoisture) * 0.75
+                );
+            steamSource = min(0.62, boilingMoisture * 0.62);
+
+            for (uint plumeLayer = 0; plumeLayer < 4; plumeLayer++) {
+                float layer = float(plumeLayer);
+                float travel = fmod(
+                    time * (0.040 + layer * 0.012) + layer * 0.051,
+                    0.22
+                );
+                float sway = sin(
+                    time * (1.7 + layer * 0.23)
+                        + imageUV.y * 13.0
+                        + layer * 2.1
+                ) * (0.007 + travel * 0.12);
+                float2 plumeUV = imageUV + float2(sway, 0.018 + travel);
+                float plumeInside = step(0.0, plumeUV.x)
+                    * step(plumeUV.x, 1.0)
+                    * step(0.0, plumeUV.y)
+                    * step(plumeUV.y, 1.0);
+                float plumeDensity = wetField.sample(
+                    imageSampler,
+                    clamp(plumeUV, 0.0, 1.0)
+                ).r * plumeInside;
+                float plumeDepositedMoisture = clamp(
+                    log2(1.0 + max(0.0, plumeDensity)) * 0.32,
+                    0.0,
+                    1.0
+                );
+                float4 plumeCombustion = combustionState.sample(
+                    imageSampler,
+                    clamp(plumeUV, 0.0, 1.0)
+                ) * plumeInside;
+                float plumeEvaporated = max(
+                    0.0,
+                    plumeDepositedMoisture - plumeCombustion.g
+                );
+                float plumeBoiling = smoothstep(0.12, 0.78, plumeCombustion.r)
+                    * max(
+                        smoothstep(0.02, 0.32, plumeEvaporated),
+                        smoothstep(0.16, 0.76, plumeCombustion.g) * 0.75
+                    );
+                float plumeLife = 1.0 - smoothstep(0.08, 0.22, travel);
+                steamPlume = max(
+                    steamPlume,
+                    plumeBoiling * plumeLife * (0.48 - layer * 0.055)
+                );
+            }
             absorptionMask = smoothstep(0.018, 0.28, bakedDensity);
             liquidMask = smoothstep(0.28, 1.40, bakedDensity)
                 * mix(0.62, 1.0, stillSoaking);
@@ -1428,14 +1525,26 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 );
             }
 
-            absorptionMask *= insideMask * wetness;
-            liquidMask *= insideMask * wetness;
+            float remainingMoistureRatio = depositedMoisture > 0.0001
+                ? clamp(combustionMoisture / depositedMoisture, 0.0, 1.0)
+                : 0.0;
+            float wetRetention = mix(
+                1.0,
+                0.05 + smoothstep(0.02, 0.90, remainingMoistureRatio) * 0.95,
+                step(1.5, wetInfo.y)
+            );
+            absorptionMask *= insideMask * wetness * wetRetention;
+            liquidMask *= insideMask * wetness * wetRetention;
+            dropletMask *= wetRetention;
+            dropletRim *= wetRetention;
+            dropletHighlight *= wetRetention;
+            localFluidDensity *= wetRetention;
             wetMask = max(
                 max(absorptionMask * 0.62, liquidMask),
                 dropletMask
             );
-            waterThickness = max(waterThickness, dropletMask) * wetness;
-            wetRim = max(wetRim, dropletRim) * insideMask * wetness;
+            waterThickness = max(waterThickness, dropletMask) * wetness * wetRetention;
+            wetRim = max(wetRim, dropletRim) * insideMask * wetness * wetRetention;
             float ripple = sin(
                 imageUV.y * 95.0
                 + fbm(imageUV * 21.0 + seedOffset) * 8.0
@@ -1688,6 +1797,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             * step(signedDistance, 0.0)
             * residualCharOpacity
             * combustibleMask
+            * terminalMaterialVisibility
             * (0.42 + grain * 0.58);
         source.a *= insideMask * max(keep, burnedResidue);
 
@@ -1714,7 +1824,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         source.rgb = mix(source.rgb, edgeSoot, scorchBand * scorchBand * 0.64);
 
         float effectMask = mix(horizontalMask, insideMask, radialMode)
-            * combustibleMask;
+            * combustibleMask
+            * radialEffectVisibility;
         float edgeDistance = abs(signedDistance);
         float burnedDistance = max(0.0, -signedDistance);
         float pixelSpan = max(fwidth(signedDistance), 0.00025);
@@ -1722,8 +1833,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         float combustionActivity = smoothstep(0.10, 0.72, combustionHeat)
             * (1.0 - smoothstep(0.88, 1.0, combustionDamage));
         float moistureDamping = 1.0
-            - smoothstep(0.18, 0.96, combustionMoisture) * 0.78;
-        effectMask *= max(0.055, combustionActivity) * moistureDamping;
+            - smoothstep(0.08, 0.72, combustionMoisture) * 0.96;
+        effectMask *= max(0.028, combustionActivity) * moistureDamping;
         float edgeFlicker = 0.58 + 0.42 * valueNoise(float2(
             imageUV.x * 127.0 + seedOffset.y,
             time * 17.0 + seedOffset.x
@@ -1737,7 +1848,9 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         float glow = effectMask
             * (1.0 - smoothstep(emberWidth * 0.48, glowWidth, edgeDistance));
         float tornEdgeArrival = tornEdge
-            * (1.0 - smoothstep(hotCoreWidth * 0.45, glowWidth * 1.35, edgeDistance));
+            * (1.0 - smoothstep(hotCoreWidth * 0.45, glowWidth * 1.35, edgeDistance))
+            * moistureDamping
+            * radialEffectVisibility;
         hotCore = max(hotCore, tornEdgeArrival * edgeFlicker * 0.82);
         emberEdge = max(emberEdge, tornEdgeArrival * 0.74);
         glow = max(glow, tornEdgeArrival * 0.52);
@@ -1869,6 +1982,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 }
             }
         }
+        spark *= radialEffectVisibility * mix(1.0, moistureDamping, soakMode);
 
         float smoke = effectMask
             * step(emberWidth, burnedDistance)
@@ -1882,10 +1996,10 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             imageUV.y * 6.0 - time * 0.72 + seedOffset.x
         ));
         float steam = insideMask
-            * smoothstep(0.08, 0.78, combustionHeat)
-            * smoothstep(0.04, 0.82, combustionMoisture)
-            * (1.0 - smoothstep(0.86, 1.0, combustionDamage))
-            * (0.035 + steamNoise * 0.11);
+            * soakMode
+            * radialEffectVisibility
+            * max(steamSource, steamPlume)
+            * (0.70 + steamNoise * 0.30);
 
         float fireAlpha = max(
             glow * 0.32,
@@ -1900,7 +2014,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             + fireRGB
             + float3(1.0, 0.48, 0.045) * spark * 2.20
             + float3(0.10, 0.075, 0.068) * smoke
-            + float3(0.72, 0.76, 0.74) * steam;
+            + float3(0.80, 0.88, 0.92) * steam * 1.18;
 
         outputRGB = outputAlpha > 0.0 ? outputRGB / outputAlpha : 0.0;
         return float4(outputRGB, outputAlpha);
