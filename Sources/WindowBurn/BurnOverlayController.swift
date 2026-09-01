@@ -4,9 +4,15 @@ import WindowBurnCore
 
 enum BurnOverlayError: LocalizedError {
   case metalUnavailable
+  case rendererUnavailable
 
   var errorDescription: String? {
-    "Metal is not available on this Mac."
+    switch self {
+    case .metalUnavailable:
+      "Metal is not available on this Mac."
+    case .rendererUnavailable:
+      "The burn overlay renderer is no longer available."
+    }
   }
 }
 
@@ -20,15 +26,19 @@ final class BurnOverlayController {
   static let padding: CGFloat = 84
 
   private var window: NSWindow?
+  private var metalView: MTKView?
   private var renderer: BurnRenderer?
 
   func present(
     image: CGImage,
     backdropImage: CGImage? = nil,
+    shadowImage: CGImage? = nil,
+    shadowSamplingOffset: CGPoint = .zero,
     panelFrame: CGRect,
     profile: BurnProfile,
     style: BurnRendererStyle = .sweep,
     presentation: BurnOverlayPresentation = .effectOverlay,
+    startImmediately: Bool = true,
     onFirstFrame: (() throws -> Void)?,
     completion: (() -> Void)? = nil
   ) throws {
@@ -92,10 +102,15 @@ final class BurnOverlayController {
       device: device,
       image: image,
       backdropImage: backdropImage,
+      shadowImage: shadowImage,
+      shadowSamplingOffset: shadowSamplingOffset,
       profile: profile,
       style: style,
       horizontalPadding: presentation == .demoWindow ? 0 : Float(Self.padding / panelFrame.width),
       verticalPadding: presentation == .demoWindow ? 0 : Float(Self.padding / panelFrame.height),
+      cornerRadius: presentation == .demoWindow
+        ? 0
+        : Float(10 / max(1, panelFrame.height - Self.padding * 2)),
       completion: { [weak self] in
         self?.dismiss()
         completion?()
@@ -116,6 +131,7 @@ final class BurnOverlayController {
     window.contentView = metalView
 
     self.window = window
+    self.metalView = metalView
     renderer = burnRenderer
     switch presentation {
     case .effectOverlay:
@@ -125,6 +141,7 @@ final class BurnOverlayController {
       window.makeKeyAndOrderFront(nil)
     }
 
+    burnRenderer.synchronizeNextFrame()
     metalView.draw()
     do {
       try onFirstFrame?()
@@ -133,9 +150,42 @@ final class BurnOverlayController {
       throw error
     }
 
+    if startImmediately {
+      startBurning()
+    }
+  }
+
+  func startBurning() {
+    guard let metalView, let renderer else { return }
+    renderer.start()
     metalView.enableSetNeedsDisplay = false
     metalView.isPaused = false
-    burnRenderer.start()
+  }
+
+  @discardableResult
+  func activateReplacementSurface() -> Bool {
+    guard
+      let metalView,
+      let renderer
+    else {
+      return false
+    }
+    renderer.activateReplacementSurface()
+    metalView.draw()
+    return true
+  }
+
+  @discardableResult
+  func prepareForIgnitionHandoff() -> Bool {
+    guard
+      let metalView,
+      let renderer,
+      renderer.prepareForIgnitionHandoff()
+    else {
+      return false
+    }
+    metalView.draw()
+    return true
   }
 
   @discardableResult
@@ -161,6 +211,7 @@ final class BurnOverlayController {
   func dismiss() {
     window?.orderOut(nil)
     window = nil
+    metalView = nil
     renderer = nil
   }
 }

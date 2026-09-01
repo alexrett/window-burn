@@ -66,9 +66,10 @@ public enum SoakEffect {
 public enum WetPaperCompositing {
   public static func sourceCoverage(
     effectCoverage: Float,
-    isBurning: Bool
+    isBurning: Bool,
+    isHandoffPrepared: Bool = false
   ) -> Float {
-    isBurning ? 1 : clamp(effectCoverage)
+    isBurning || isHandoffPrepared ? 1 : clamp(effectCoverage)
   }
 
   public static func materialCoverage(ruptureCoverage: Float) -> Float {

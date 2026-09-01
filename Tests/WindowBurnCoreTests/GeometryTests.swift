@@ -40,6 +40,94 @@ struct GeometryTests {
 
     #expect(point == CGPoint(x: 320, y: 820))
   }
+
+  @Test("The overlay shadow separates only the surviving external silhouette")
+  func preservesWindowDepthDuringBurn() {
+    let visibleEdge = OverlayDepthModel.exteriorShadowOpacity(
+      outsideDistance: 0.012,
+      materialVisibility: 1,
+      isNativeWindowVisible: false
+    )
+    let nativeShadowStillVisible = OverlayDepthModel.exteriorShadowOpacity(
+      outsideDistance: 0.012,
+      materialVisibility: 1,
+      isNativeWindowVisible: true
+    )
+    let burnedEdge = OverlayDepthModel.exteriorShadowOpacity(
+      outsideDistance: 0.012,
+      materialVisibility: 0,
+      isNativeWindowVisible: false
+    )
+    let beyondShadow = OverlayDepthModel.exteriorShadowOpacity(
+      outsideDistance: 0.09,
+      materialVisibility: 1,
+      isNativeWindowVisible: false
+    )
+
+    #expect(visibleEdge > 0.15)
+    #expect(nativeShadowStillVisible == 0)
+    #expect(burnedEdge == 0)
+    #expect(beyondShadow == 0)
+  }
+
+  @Test("The captured system shadow aligns with the original window")
+  func alignsCapturedWindowShadow() {
+    let offset = OverlayDepthModel.shadowSamplingOffset(
+      capturedContentOrigin: CGPoint(x: 112, y: 76),
+      desiredContentOrigin: CGPoint(x: 168, y: 168),
+      textureSize: CGSize(width: 1_776, height: 1_400)
+    )
+
+    #expect(abs(offset.x + 56 / 1_776) < 0.000_001)
+    #expect(abs(offset.y + 92 / 1_400) < 0.000_001)
+  }
+
+  @Test("The replacement shadow appears only after the native window closes")
+  func activatesCapturedWindowShadowAtomically() {
+    let beforeHandoff = OverlayDepthModel.nativeShadowOpacity(
+      capturedAlpha: 0.48,
+      exteriorCoverage: 1,
+      materialVisibility: 1,
+      isReplacementActive: false
+    )
+    let afterHandoff = OverlayDepthModel.nativeShadowOpacity(
+      capturedAlpha: 0.48,
+      exteriorCoverage: 1,
+      materialVisibility: 1,
+      isReplacementActive: true
+    )
+    let burnedAway = OverlayDepthModel.nativeShadowOpacity(
+      capturedAlpha: 0.48,
+      exteriorCoverage: 1,
+      materialVisibility: 0,
+      isReplacementActive: true
+    )
+
+    #expect(beforeHandoff == 0)
+    #expect(afterHandoff > 0.47)
+    #expect(burnedAway == 0)
+  }
+
+  @Test("Rounded window corners are outside the combustible silhouette")
+  func clipsRoundedWindowCorners() {
+    let topEdge = OverlayDepthModel.roundedRectangleSignedDistance(
+      x: 0.5,
+      y: 0,
+      aspect: 1.5,
+      cornerRadius: 0.025
+    )
+    let squareCorner = OverlayDepthModel.roundedRectangleSignedDistance(
+      x: 0,
+      y: 0,
+      aspect: 1.5,
+      cornerRadius: 0.025
+    )
+
+    #expect(abs(topEdge) < 0.001)
+    #expect(squareCorner > 0.005)
+    #expect(OverlayDepthModel.materialCoverage(sourceAlpha: 0, rectangleCoverage: 1) == 0)
+    #expect(OverlayDepthModel.materialCoverage(sourceAlpha: 1, rectangleCoverage: 1) == 1)
+  }
 }
 
 @Suite("Capture pixel sizing")

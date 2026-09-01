@@ -105,3 +105,69 @@ public enum BurnTiming {
     return min(1, max(0, elapsed / duration))
   }
 }
+
+public enum OverlayDepthModel {
+  public static func shadowSamplingOffset(
+    capturedContentOrigin: CGPoint,
+    desiredContentOrigin: CGPoint,
+    textureSize: CGSize
+  ) -> CGPoint {
+    guard textureSize.width > 0, textureSize.height > 0 else { return .zero }
+    return CGPoint(
+      x: (capturedContentOrigin.x - desiredContentOrigin.x) / textureSize.width,
+      y: (capturedContentOrigin.y - desiredContentOrigin.y) / textureSize.height
+    )
+  }
+
+  public static func nativeShadowOpacity(
+    capturedAlpha: Float,
+    exteriorCoverage: Float,
+    materialVisibility: Float,
+    isReplacementActive: Bool
+  ) -> Float {
+    guard isReplacementActive else { return 0 }
+    return min(1, max(0, capturedAlpha))
+      * min(1, max(0, exteriorCoverage))
+      * smoothstep(0.08, 0.72, materialVisibility)
+  }
+
+  public static func roundedRectangleSignedDistance(
+    x: Float,
+    y: Float,
+    aspect: Float,
+    cornerRadius: Float
+  ) -> Float {
+    let validAspect = max(0.001, aspect)
+    let radius = min(0.5, validAspect * 0.5, max(0, cornerRadius))
+    let distanceX = abs(x - 0.5) * validAspect - (validAspect * 0.5 - radius)
+    let distanceY = abs(y - 0.5) - (0.5 - radius)
+    let outsideX = max(0, distanceX)
+    let outsideY = max(0, distanceY)
+    let outside = sqrt(outsideX * outsideX + outsideY * outsideY)
+    let inside = min(max(distanceX, distanceY), 0)
+    return outside + inside - radius
+  }
+
+  public static func materialCoverage(
+    sourceAlpha: Float,
+    rectangleCoverage: Float
+  ) -> Float {
+    min(1, max(0, sourceAlpha)) * min(1, max(0, rectangleCoverage))
+  }
+
+  public static func exteriorShadowOpacity(
+    outsideDistance: Float,
+    materialVisibility: Float,
+    isNativeWindowVisible: Bool
+  ) -> Float {
+    guard !isNativeWindowVisible else { return 0 }
+    let distanceFade = 1 - smoothstep(0.006, 0.065, max(0, outsideDistance))
+    let survivingMaterial = smoothstep(0.08, 0.72, materialVisibility)
+    return distanceFade * survivingMaterial * 0.30
+  }
+
+  private static func smoothstep(_ edge0: Float, _ edge1: Float, _ value: Float) -> Float {
+    let normalized = min(1, max(0, (value - edge0) / (edge1 - edge0)))
+    return normalized * normalized * (3 - 2 * normalized)
+  }
+}

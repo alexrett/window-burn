@@ -5,6 +5,8 @@ public struct BurnVisualProfile: Equatable, Sendable {
   public let flameReach: Float
   public let sparkDensity: Float
   public let residualCharOpacity: Float
+  public let radialContourWarp: Float
+  public let radialBiteDepth: Float
 
   public init(
     hotCoreWidth: Float,
@@ -12,7 +14,9 @@ public struct BurnVisualProfile: Equatable, Sendable {
     glowWidth: Float,
     flameReach: Float,
     sparkDensity: Float,
-    residualCharOpacity: Float
+    residualCharOpacity: Float,
+    radialContourWarp: Float = 0.11,
+    radialBiteDepth: Float = 0.05
   ) {
     self.hotCoreWidth = hotCoreWidth
     self.emberWidth = emberWidth
@@ -20,6 +24,8 @@ public struct BurnVisualProfile: Equatable, Sendable {
     self.flameReach = flameReach
     self.sparkDensity = sparkDensity
     self.residualCharOpacity = residualCharOpacity
+    self.radialContourWarp = radialContourWarp
+    self.radialBiteDepth = radialBiteDepth
   }
 
   public static let cinematic = BurnVisualProfile(
@@ -28,6 +34,8 @@ public struct BurnVisualProfile: Equatable, Sendable {
     glowWidth: 0.094,
     flameReach: 0.20,
     sparkDensity: 0.28,
-    residualCharOpacity: 0
+    residualCharOpacity: 0,
+    radialContourWarp: 0.195,
+    radialBiteDepth: 0.076
   )
 }

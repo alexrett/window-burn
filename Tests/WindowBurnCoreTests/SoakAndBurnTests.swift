@@ -144,6 +144,17 @@ struct SoakAndBurnTests {
     #expect(WetPaperCompositing.sourceCoverage(effectCoverage: 0, isBurning: true) == 1)
   }
 
+  @Test("The captured window is fully covered before the native window closes")
+  func preparesAnAtomicBurnHandoff() {
+    #expect(
+      WetPaperCompositing.sourceCoverage(
+        effectCoverage: 0,
+        isBurning: false,
+        isHandoffPrepared: true
+      ) == 1
+    )
+  }
+
   @Test("A ruptured hole is no longer combustible material")
   func excludesHolesFromCombustion() {
     #expect(WetPaperCompositing.materialCoverage(ruptureCoverage: 0) == 1)
