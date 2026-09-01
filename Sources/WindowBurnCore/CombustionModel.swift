@@ -125,7 +125,7 @@ public struct CombustionVisualResponse: Equatable, Sendable {
 
 public enum CombustionVisualModel {
   public static func completionProgress(isRadial: Bool) -> Float {
-    isRadial ? 0.82 : 1
+    1
   }
 
   public static func borderVisibility(
@@ -143,13 +143,14 @@ public enum CombustionVisualModel {
     heat: Float,
     damage: Float,
     progress: Float,
-    isRadial: Bool
+    isRadial: Bool,
+    geometricVisibility: Float = 1
   ) -> CombustionVisualResponse {
     let depositedMoisture = clamp(depositedMoisture)
     let remainingMoisture = min(clamp(remainingMoisture), depositedMoisture)
     let heat = max(0, heat)
     let damage = clamp(damage)
-    let progress = clamp(progress)
+    let geometricVisibility = clamp(geometricVisibility)
 
     let moistureDamping = 1 - smoothstep(0.08, 0.72, remainingMoisture) * 0.96
     let evaporatedMoisture = max(0, depositedMoisture - remainingMoisture)
@@ -164,22 +165,18 @@ public enum CombustionVisualModel {
       smoothstep(0.06, 0.34, damage)
       * (1 - smoothstep(0.72, 0.98, damage))
 
-    let effectVisibility =
-      isRadial
-      ? 1 - smoothstep(0.60, 0.82, progress)
-      : 1
-    let terminalMaterialVisibility =
-      isRadial
-      ? 1 - smoothstep(0.70, 0.82, progress)
-      : 1
     let undamagedMaterial = 1 - smoothstep(0.50, 0.98, damage)
+    let materialVisibility =
+      isRadial
+      ? min(geometricVisibility, undamagedMaterial)
+      : geometricVisibility
 
     return CombustionVisualResponse(
       fireVisibility: moistureDamping,
       steamOpacity: steamOpacity,
       scorchOpacity: scorchOpacity,
-      effectVisibility: effectVisibility,
-      materialVisibility: undamagedMaterial * terminalMaterialVisibility
+      effectVisibility: 1,
+      materialVisibility: materialVisibility
     )
   }
 

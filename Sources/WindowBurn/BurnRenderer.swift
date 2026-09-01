@@ -1128,16 +1128,6 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             hotCoreWidth * 1.65,
             signedDistance + edgeBreakup
         );
-        float radialEffectVisibility = mix(
-            1.0,
-            1.0 - smoothstep(0.60, 0.82, progress),
-            radialMode
-        );
-        float terminalMaterialVisibility = mix(
-            1.0,
-            1.0 - smoothstep(0.70, 0.82, progress),
-            radialMode
-        );
         float physicalBorderDistance = min(
             min(imageUV.x, 1.0 - imageUV.x) * aspect,
             min(imageUV.y, 1.0 - imageUV.y)
@@ -1147,7 +1137,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             smoothstep(0.0, 0.085, physicalBorderDistance),
             radialMode
         );
-        radialEffectVisibility *= borderSuppression;
+        float radialEffectVisibility = borderSuppression;
         float damageContour = fbm(
             imageUV * float2(6.8, 5.4) + seedOffset * 4.3
         );
@@ -1167,7 +1157,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             1.0
         );
         float stateKeep = 1.0 - smoothstep(0.50, 0.98, fracturedDamage);
-        keep = max(keep, stateKeep) * terminalMaterialVisibility;
+        keep = mix(keep, min(keep, stateKeep), radialMode);
         float2 sourceUV = imageUV;
         float wetMask = 0.0;
         float waterThickness = 0.0;
@@ -1859,7 +1849,6 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             * step(signedDistance, 0.0)
             * residualCharOpacity
             * combustibleMask
-            * terminalMaterialVisibility
             * (0.42 + grain * 0.58);
         source.a *= insideMask * max(keep, burnedResidue);
 

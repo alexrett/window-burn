@@ -151,8 +151,8 @@ struct CombustionModelTests {
     #expect(damaged.scorchOpacity > fresh.scorchOpacity)
   }
 
-  @Test("Radial fire collapses before it can linger on a window edge")
-  func radialFireHasNoTerminalTail() {
+  @Test("Radial fire remains attached to its front instead of globally fading")
+  func radialFireHasNoGlobalTerminalFade() {
     let response = CombustionVisualModel.response(
       depositedMoisture: 0,
       remainingMoisture: 0,
@@ -162,8 +162,7 @@ struct CombustionModelTests {
       isRadial: true
     )
 
-    #expect(response.effectVisibility < 0.01)
-    #expect(response.materialVisibility < 0.01)
+    #expect(response.effectVisibility == 1)
   }
 
   @Test("Radial fire fades before rectangular clipping can create a straight seam")
@@ -196,24 +195,34 @@ struct CombustionModelTests {
     #expect(sweepAtBorder == 1)
   }
 
-  @Test("Terminal fade leaves the active middle of a burn untouched")
-  func terminalFadeStartsLate() {
-    let response = CombustionVisualModel.response(
+  @Test("A passed radial front cannot be held by undamaged combustion state")
+  func radialGeometryRemovesMaterialWithoutAStaleWindowOutline() {
+    let behindFront = CombustionVisualModel.response(
       depositedMoisture: 0,
       remainingMoisture: 0,
       heat: 1,
-      damage: 0.4,
+      damage: 0,
       progress: 0.52,
-      isRadial: true
+      isRadial: true,
+      geometricVisibility: 0
+    )
+    let aheadOfFront = CombustionVisualModel.response(
+      depositedMoisture: 0,
+      remainingMoisture: 0,
+      heat: 0,
+      damage: 0,
+      progress: 0.52,
+      isRadial: true,
+      geometricVisibility: 1
     )
 
-    #expect(response.effectVisibility == 1)
-    #expect(response.materialVisibility > 0)
+    #expect(behindFront.materialVisibility == 0)
+    #expect(aheadOfFront.materialVisibility == 1)
   }
 
-  @Test("A radial overlay closes as soon as its visible burn has collapsed")
-  func radialOverlayDoesNotLeaveAnEmptyFrame() {
-    #expect(CombustionVisualModel.completionProgress(isRadial: true) == 0.82)
+  @Test("A radial overlay remains until its front has traversed the whole window")
+  func radialOverlayCompletesAtFullProgress() {
+    #expect(CombustionVisualModel.completionProgress(isRadial: true) == 1)
     #expect(CombustionVisualModel.completionProgress(isRadial: false) == 1)
   }
 }
