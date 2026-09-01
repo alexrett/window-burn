@@ -54,6 +54,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   private let stepCombustionPipeline: MTLComputePipelineState
   private let texture: MTLTexture
   private let backdropTexture: MTLTexture
+  private let shadowTexture: MTLTexture
   private let wetAccumulationTexture: MTLTexture
   private let combustionStateTextures: [MTLTexture]
   private let sampler: MTLSamplerState
@@ -65,6 +66,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   private let horizontalPadding: Float
   private let verticalPadding: Float
   private let cornerRadius: Float
+  private let shadowSamplingOffset: SIMD2<Float>
+  private let hasCapturedWindowShadow: Bool
   private let completion: () -> Void
   private var ignitionField: TorchIgnitionField
   private var wetDepositQueue: WetDepositQueue
@@ -76,6 +79,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   private var soakEndedAt: TimeInterval?
   private var burnStartedAt: TimeInterval?
   private var isHandoffPrepared = false
+  private var isReplacementSurfaceActive = false
   private var shouldSynchronizeNextFrame = false
   private var hasCompleted = false
 
@@ -83,6 +87,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     device: MTLDevice,
     image: CGImage,
     backdropImage: CGImage?,
+    shadowImage: CGImage?,
+    shadowSamplingOffset: CGPoint,
     profile: BurnProfile,
     style: BurnRendererStyle,
     horizontalPadding: Float,
@@ -102,6 +108,11 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     self.horizontalPadding = horizontalPadding
     self.verticalPadding = verticalPadding
     self.cornerRadius = cornerRadius
+    self.shadowSamplingOffset = SIMD2<Float>(
+      Float(shadowSamplingOffset.x),
+      Float(shadowSamplingOffset.y)
+    )
+    self.hasCapturedWindowShadow = shadowImage != nil
     self.completion = completion
     var ignitionField = TorchIgnitionField()
     if case .torch(let initialIgnitions) = style {
@@ -182,6 +193,10 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         cgImage: backdropImage ?? image,
         options: textureOptions
       )
+      shadowTexture = try textureLoader.newTexture(
+        cgImage: shadowImage ?? image,
+        options: textureOptions
+      )
     } catch {
       throw BurnRendererError.texture(error.localizedDescription)
     }
@@ -207,6 +222,11 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   }
 
   func synchronizeNextFrame() {
+    shouldSynchronizeNextFrame = true
+  }
+
+  func activateReplacementSurface() {
+    isReplacementSurfaceActive = true
     shouldSynchronizeNextFrame = true
   }
 
@@ -368,6 +388,12 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       wetVisualProfile.tearFullDensity
     )
     var windowCornerRadius = cornerRadius
+    var replacementInfo = SIMD4<Float>(
+      isReplacementSurfaceActive ? 1 : 0,
+      hasCapturedWindowShadow ? 1 : 0,
+      shadowSamplingOffset.x,
+      shadowSamplingOffset.y
+    )
     var wetUniforms =
       activeWetPoint.map { point in
         [SIMD4<Float>(point.x, point.y, profile.seed + 11.73, impactFade)]
@@ -419,6 +445,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       combustionStateTextures[currentCombustionTextureIndex],
       index: 3
     )
+    encoder.setFragmentTexture(shadowTexture, index: 4)
     encoder.setFragmentSamplerState(sampler, index: 0)
     encoder.setFragmentBytes(&timing, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
     encoder.setFragmentBytes(&padding, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
@@ -468,6 +495,11 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       &windowCornerRadius,
       length: MemoryLayout<Float>.stride,
       index: 14
+    )
+    encoder.setFragmentBytes(
+      &replacementInfo,
+      length: MemoryLayout<SIMD4<Float>>.stride,
+      index: 15
     )
     encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
     encoder.endEncoding()
@@ -1035,6 +1067,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         texture2d<float> wetField [[texture(1)]],
         texture2d<float> backdrop [[texture(2)]],
         texture2d<float> combustionState [[texture(3)]],
+        texture2d<float> windowShadow [[texture(4)]],
         sampler imageSampler [[sampler(0)]],
         constant float2 &timing [[buffer(0)]],
         constant float2 &padding [[buffer(1)]],
@@ -1050,7 +1083,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         constant float4 &waterDetail [[buffer(11)]],
         constant float4 &waterGeometry [[buffer(12)]],
         constant float4 &wetPaperDamage [[buffer(13)]],
-        constant float &windowCornerRadius [[buffer(14)]]
+        constant float &windowCornerRadius [[buffer(14)]],
+        constant float4 &replacementInfo [[buffer(15)]]
     ) {
         float progress = timing.x;
         float time = timing.y;
@@ -2104,24 +2138,40 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             + hotWhite * hotCore * 1.95;
         float outsideDistance = max(0.0, roundedRectangleDistance);
         float shapeAntialias = max(fwidth(roundedRectangleDistance), 0.0005);
-        float exterior = smoothstep(
+        float exterior = 1.0 - insideMask;
+        float replacementActive = replacementInfo.x;
+        float hasNativeShadow = replacementInfo.y;
+        float survivingExterior = smoothstep(0.08, 0.72, keep);
+        float4 capturedShadow = windowShadow.sample(
+            imageSampler,
+            input.uv + replacementInfo.zw
+        );
+        float nativeShadowAlpha = capturedShadow.a
+            * exterior
+            * survivingExterior
+            * replacementActive
+            * hasNativeShadow;
+        float fallbackExterior = smoothstep(
             -shapeAntialias,
             shapeAntialias,
             roundedRectangleDistance
         );
-        float handoffVisibility = 1.0 - preserveNativeWindow;
-        float survivingExterior = smoothstep(0.08, 0.72, keep);
         float exteriorShadow = exterior
             * (1.0 - smoothstep(0.006, 0.065, outsideDistance))
             * survivingExterior
-            * handoffVisibility
+            * replacementActive
+            * (1.0 - hasNativeShadow)
             * 0.30;
-        float exteriorRim = exterior
+        float exteriorRim = fallbackExterior
             * (1.0 - smoothstep(0.0, 0.0045, outsideDistance))
             * survivingExterior
-            * handoffVisibility
+            * replacementActive
+            * (1.0 - hasNativeShadow)
             * 0.18;
-        float exteriorDepth = max(exteriorShadow, exteriorRim);
+        float exteriorDepth = max(
+            nativeShadowAlpha,
+            max(exteriorShadow, exteriorRim)
+        );
         float outputAlpha = max(
             source.a,
             max(exteriorDepth, max(fireAlpha, max(spark, max(smoke, steam))))
@@ -2131,6 +2181,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             + float3(1.0, 0.48, 0.045) * spark * 2.20
             + float3(0.10, 0.075, 0.068) * smoke
             + float3(0.80, 0.88, 0.92) * steam * 1.18
+            + capturedShadow.rgb * nativeShadowAlpha
             + float3(0.012, 0.010, 0.009) * exteriorShadow
             + float3(0.20, 0.17, 0.13) * exteriorRim;
 

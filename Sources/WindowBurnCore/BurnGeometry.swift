@@ -107,6 +107,30 @@ public enum BurnTiming {
 }
 
 public enum OverlayDepthModel {
+  public static func shadowSamplingOffset(
+    capturedContentOrigin: CGPoint,
+    desiredContentOrigin: CGPoint,
+    textureSize: CGSize
+  ) -> CGPoint {
+    guard textureSize.width > 0, textureSize.height > 0 else { return .zero }
+    return CGPoint(
+      x: (capturedContentOrigin.x - desiredContentOrigin.x) / textureSize.width,
+      y: (capturedContentOrigin.y - desiredContentOrigin.y) / textureSize.height
+    )
+  }
+
+  public static func nativeShadowOpacity(
+    capturedAlpha: Float,
+    exteriorCoverage: Float,
+    materialVisibility: Float,
+    isReplacementActive: Bool
+  ) -> Float {
+    guard isReplacementActive else { return 0 }
+    return min(1, max(0, capturedAlpha))
+      * min(1, max(0, exteriorCoverage))
+      * smoothstep(0.08, 0.72, materialVisibility)
+  }
+
   public static func roundedRectangleSignedDistance(
     x: Float,
     y: Float,

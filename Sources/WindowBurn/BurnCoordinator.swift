@@ -43,6 +43,8 @@ final class BurnCoordinator {
 
         try overlay.present(
           image: capturedWindow.image,
+          shadowImage: capturedWindow.shadowImage,
+          shadowSamplingOffset: capturedWindow.shadowSamplingOffset,
           panelFrame: panelFrame,
           profile: profile,
           startImmediately: false,
@@ -50,6 +52,9 @@ final class BurnCoordinator {
           completion: { [weak self] in self?.isBusy = false }
         )
         try await AccessibilityWindowService.closeDiscardingUnsavedChanges(accessibleWindow)
+        guard overlay.activateReplacementSurface() else {
+          throw BurnOverlayError.rendererUnavailable
+        }
         overlay.startBurning()
         logger.info(
           "Burning front window owned by pid \(accessibleWindow.target.ownerPID), duration \(profile.duration, format: .fixed(precision: 2))s"
@@ -85,6 +90,8 @@ final class BurnCoordinator {
 
         try overlay.present(
           image: capturedWindow.image,
+          shadowImage: capturedWindow.shadowImage,
+          shadowSamplingOffset: capturedWindow.shadowSamplingOffset,
           panelFrame: panelFrame,
           profile: profile,
           startImmediately: false,
@@ -93,6 +100,9 @@ final class BurnCoordinator {
         )
         actionPerformed = true
         try await AccessibilityWindowService.closeDiscardingUnsavedChanges(control.window)
+        guard overlay.activateReplacementSurface() else {
+          throw BurnOverlayError.rendererUnavailable
+        }
         overlay.startBurning()
         logger.info(
           "Burning intercepted \(control.kind.logName, privacy: .public) action for pid \(control.window.target.ownerPID), duration \(profile.duration, format: .fixed(precision: 2))s"
@@ -186,6 +196,8 @@ final class BurnCoordinator {
         let profile = BurnProfile.randomTorch()
         try overlay.present(
           image: capturedWindow.image,
+          shadowImage: capturedWindow.shadowImage,
+          shadowSamplingOffset: capturedWindow.shadowSamplingOffset,
           panelFrame: panelFrame,
           profile: profile,
           style: .torch(initialIgnitions: ignitionPoints),
@@ -196,6 +208,9 @@ final class BurnCoordinator {
           }
         )
         try await AccessibilityWindowService.closeDiscardingUnsavedChanges(accessibleWindow)
+        guard overlay.activateReplacementSurface() else {
+          throw BurnOverlayError.rendererUnavailable
+        }
         overlay.startBurning()
         isTorchOverlayActive = true
         logger.info(
@@ -430,6 +445,8 @@ final class BurnCoordinator {
         try overlay.present(
           image: capturedWindow.image,
           backdropImage: capturedWindow.backdropImage,
+          shadowImage: capturedWindow.shadowImage,
+          shadowSamplingOffset: capturedWindow.shadowSamplingOffset,
           panelFrame: panelFrame,
           profile: profile,
           style: .soakAndBurn(initialSoakPoints: initialSoakPoints),
@@ -487,6 +504,7 @@ final class BurnCoordinator {
         guard generation == soakGeneration, !Task.isCancelled else { return }
         soakCloseTask = nil
         guard
+          overlay.activateReplacementSurface(),
           soakAndBurnSession.beginBurning(),
           overlay.igniteSoakedWindow(at: ignition)
         else {

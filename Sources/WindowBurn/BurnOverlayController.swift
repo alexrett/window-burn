@@ -4,9 +4,15 @@ import WindowBurnCore
 
 enum BurnOverlayError: LocalizedError {
   case metalUnavailable
+  case rendererUnavailable
 
   var errorDescription: String? {
-    "Metal is not available on this Mac."
+    switch self {
+    case .metalUnavailable:
+      "Metal is not available on this Mac."
+    case .rendererUnavailable:
+      "The burn overlay renderer is no longer available."
+    }
   }
 }
 
@@ -26,6 +32,8 @@ final class BurnOverlayController {
   func present(
     image: CGImage,
     backdropImage: CGImage? = nil,
+    shadowImage: CGImage? = nil,
+    shadowSamplingOffset: CGPoint = .zero,
     panelFrame: CGRect,
     profile: BurnProfile,
     style: BurnRendererStyle = .sweep,
@@ -94,6 +102,8 @@ final class BurnOverlayController {
       device: device,
       image: image,
       backdropImage: backdropImage,
+      shadowImage: shadowImage,
+      shadowSamplingOffset: shadowSamplingOffset,
       profile: profile,
       style: style,
       horizontalPadding: presentation == .demoWindow ? 0 : Float(Self.padding / panelFrame.width),
@@ -150,6 +160,19 @@ final class BurnOverlayController {
     renderer.start()
     metalView.enableSetNeedsDisplay = false
     metalView.isPaused = false
+  }
+
+  @discardableResult
+  func activateReplacementSurface() -> Bool {
+    guard
+      let metalView,
+      let renderer
+    else {
+      return false
+    }
+    renderer.activateReplacementSurface()
+    metalView.draw()
+    return true
   }
 
   @discardableResult

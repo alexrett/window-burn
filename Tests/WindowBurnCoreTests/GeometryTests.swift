@@ -70,6 +70,44 @@ struct GeometryTests {
     #expect(beyondShadow == 0)
   }
 
+  @Test("The captured system shadow aligns with the original window")
+  func alignsCapturedWindowShadow() {
+    let offset = OverlayDepthModel.shadowSamplingOffset(
+      capturedContentOrigin: CGPoint(x: 112, y: 76),
+      desiredContentOrigin: CGPoint(x: 168, y: 168),
+      textureSize: CGSize(width: 1_776, height: 1_400)
+    )
+
+    #expect(abs(offset.x + 56 / 1_776) < 0.000_001)
+    #expect(abs(offset.y + 92 / 1_400) < 0.000_001)
+  }
+
+  @Test("The replacement shadow appears only after the native window closes")
+  func activatesCapturedWindowShadowAtomically() {
+    let beforeHandoff = OverlayDepthModel.nativeShadowOpacity(
+      capturedAlpha: 0.48,
+      exteriorCoverage: 1,
+      materialVisibility: 1,
+      isReplacementActive: false
+    )
+    let afterHandoff = OverlayDepthModel.nativeShadowOpacity(
+      capturedAlpha: 0.48,
+      exteriorCoverage: 1,
+      materialVisibility: 1,
+      isReplacementActive: true
+    )
+    let burnedAway = OverlayDepthModel.nativeShadowOpacity(
+      capturedAlpha: 0.48,
+      exteriorCoverage: 1,
+      materialVisibility: 0,
+      isReplacementActive: true
+    )
+
+    #expect(beforeHandoff == 0)
+    #expect(afterHandoff > 0.47)
+    #expect(burnedAway == 0)
+  }
+
   @Test("Rounded window corners are outside the combustible silhouette")
   func clipsRoundedWindowCorners() {
     let topEdge = OverlayDepthModel.roundedRectangleSignedDistance(
