@@ -36,17 +36,31 @@ enum BurnRendererStyle {
 
 @MainActor
 final class BurnRenderer: NSObject, MTKViewDelegate {
+  private struct PipelineResources {
+    let render: MTLRenderPipelineState
+    let clearWet: MTLComputePipelineState
+    let accumulateWet: MTLComputePipelineState
+    let initializeCombustion: MTLComputePipelineState
+    let stepCombustion: MTLComputePipelineState
+  }
+
+  private static var pipelineResourcesByRegistryID: [UInt64: PipelineResources] = [:]
+
   private let commandQueue: MTLCommandQueue
   private let pipeline: MTLRenderPipelineState
   private let clearWetPipeline: MTLComputePipelineState
   private let accumulateWetPipeline: MTLComputePipelineState
+  private let initializeCombustionPipeline: MTLComputePipelineState
+  private let stepCombustionPipeline: MTLComputePipelineState
   private let texture: MTLTexture
   private let backdropTexture: MTLTexture
   private let wetAccumulationTexture: MTLTexture
+  private let combustionStateTextures: [MTLTexture]
   private let sampler: MTLSamplerState
   private let profile: BurnProfile
   private let visualProfile: BurnVisualProfile
   private let wetVisualProfile: WetVisualProfile
+  private let combustionProfile: CombustionProfile
   private let style: BurnRendererStyle
   private let horizontalPadding: Float
   private let verticalPadding: Float
@@ -54,6 +68,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   private var ignitionField: TorchIgnitionField
   private var wetDepositQueue: WetDepositQueue
   private var isWetTextureInitialized = false
+  private var isCombustionStateInitialized = false
+  private var currentCombustionTextureIndex = 0
   private var startTime: CFTimeInterval?
   private var lastDrawTime: CFTimeInterval?
   private var soakEndedAt: TimeInterval?
@@ -77,6 +93,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     self.profile = profile
     self.visualProfile = .cinematic
     self.wetVisualProfile = .cinematic
+    self.combustionProfile = .cinematic
     self.style = style
     self.horizontalPadding = horizontalPadding
     self.verticalPadding = verticalPadding
@@ -96,39 +113,12 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     }
     self.wetDepositQueue = wetDepositQueue
 
-    let library: MTLLibrary
-    do {
-      library = try device.makeLibrary(source: Self.shaderSource, options: nil)
-    } catch {
-      throw BurnRendererError.shaderCompilation(error.localizedDescription)
-    }
-    guard
-      let vertexFunction = library.makeFunction(name: "burnVertex"),
-      let fragmentFunction = library.makeFunction(name: "burnFragment"),
-      let clearWetFunction = library.makeFunction(name: "clearWetField"),
-      let accumulateWetFunction = library.makeFunction(name: "accumulateWetField")
-    else {
-      throw BurnRendererError.shaderFunction
-    }
-
-    let descriptor = MTLRenderPipelineDescriptor()
-    descriptor.vertexFunction = vertexFunction
-    descriptor.fragmentFunction = fragmentFunction
-    descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-    descriptor.colorAttachments[0].isBlendingEnabled = true
-    descriptor.colorAttachments[0].rgbBlendOperation = .add
-    descriptor.colorAttachments[0].alphaBlendOperation = .add
-    descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-    descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
-    descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-    descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-    do {
-      pipeline = try device.makeRenderPipelineState(descriptor: descriptor)
-      clearWetPipeline = try device.makeComputePipelineState(function: clearWetFunction)
-      accumulateWetPipeline = try device.makeComputePipelineState(function: accumulateWetFunction)
-    } catch {
-      throw BurnRendererError.pipeline(error.localizedDescription)
-    }
+    let pipelineResources = try Self.pipelineResources(for: device)
+    pipeline = pipelineResources.render
+    clearWetPipeline = pipelineResources.clearWet
+    accumulateWetPipeline = pipelineResources.accumulateWet
+    initializeCombustionPipeline = pipelineResources.initializeCombustion
+    stepCombustionPipeline = pipelineResources.stepCombustion
 
     let imageAspect = CGFloat(image.width) / CGFloat(max(1, image.height))
     let wetTextureWidth: Int
@@ -152,6 +142,26 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       throw BurnRendererError.texture("Metal could not create the wet accumulation texture.")
     }
     self.wetAccumulationTexture = wetAccumulationTexture
+
+    let combustionTextureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .rgba16Float,
+      width: wetTextureWidth,
+      height: wetTextureHeight,
+      mipmapped: false
+    )
+    combustionTextureDescriptor.storageMode = .private
+    combustionTextureDescriptor.usage = [.shaderRead, .shaderWrite]
+    guard
+      let firstCombustionTexture = device.makeTexture(
+        descriptor: combustionTextureDescriptor
+      ),
+      let secondCombustionTexture = device.makeTexture(
+        descriptor: combustionTextureDescriptor
+      )
+    else {
+      throw BurnRendererError.texture("Metal could not create the combustion state textures.")
+    }
+    combustionStateTextures = [firstCombustionTexture, secondCombustionTexture]
 
     let textureLoader = MTKTextureLoader(device: device)
     let textureOptions: [MTKTextureLoader.Option: Any] = [
@@ -257,9 +267,6 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       )
     }
     guard encodeWetFieldUpdates(wetDeposits, on: commandBuffer) else { return }
-    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else {
-      return
-    }
 
     let burnElapsed: TimeInterval
     if case .soakAndBurn = style {
@@ -358,6 +365,20 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       ignitionUniforms.append(.zero)
     }
 
+    guard
+      encodeCombustionFieldUpdate(
+        progress: timing.x,
+        elapsed: Float(elapsed),
+        frameDuration: Float(frameDuration),
+        effectMode: effectMode,
+        ignitionUniforms: ignitionUniforms,
+        on: commandBuffer
+      )
+    else { return }
+    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else {
+      return
+    }
+
     encoder.setRenderPipelineState(pipeline)
     encoder.setViewport(
       MTLViewport(
@@ -372,6 +393,10 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     encoder.setFragmentTexture(texture, index: 0)
     encoder.setFragmentTexture(wetAccumulationTexture, index: 1)
     encoder.setFragmentTexture(backdropTexture, index: 2)
+    encoder.setFragmentTexture(
+      combustionStateTextures[currentCombustionTextureIndex],
+      index: 3
+    )
     encoder.setFragmentSamplerState(sampler, index: 0)
     encoder.setFragmentBytes(&timing, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
     encoder.setFragmentBytes(&padding, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
@@ -498,12 +523,158 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     return true
   }
 
+  private func encodeCombustionFieldUpdate(
+    progress: Float,
+    elapsed: Float,
+    frameDuration: Float,
+    effectMode: Float,
+    ignitionUniforms: [SIMD4<Float>],
+    on commandBuffer: MTLCommandBuffer
+  ) -> Bool {
+    if !isCombustionStateInitialized {
+      guard let initializeEncoder = commandBuffer.makeComputeCommandEncoder() else {
+        return false
+      }
+      initializeEncoder.setComputePipelineState(initializeCombustionPipeline)
+      initializeEncoder.setTexture(wetAccumulationTexture, index: 0)
+      initializeEncoder.setTexture(combustionStateTextures[0], index: 1)
+      initializeEncoder.dispatchThreads(
+        MTLSize(
+          width: combustionStateTextures[0].width,
+          height: combustionStateTextures[0].height,
+          depth: 1
+        ),
+        threadsPerThreadgroup: computeThreadgroupSize(for: initializeCombustionPipeline)
+      )
+      initializeEncoder.endEncoding()
+      isCombustionStateInitialized = true
+      currentCombustionTextureIndex = 0
+    }
+
+    let nextCombustionTextureIndex = 1 - currentCombustionTextureIndex
+    guard let stepEncoder = commandBuffer.makeComputeCommandEncoder() else {
+      return false
+    }
+    var timing = SIMD4<Float>(
+      progress,
+      elapsed,
+      Float(profile.duration),
+      frameDuration
+    )
+    let acceptsNewMoisture = effectMode > 1.5 && ignitionField.ignitions.isEmpty
+    var mode = SIMD4<Float>(
+      effectMode,
+      Float(ignitionField.ignitions.count),
+      acceptsNewMoisture ? 1 : 0,
+      0
+    )
+    var fieldInfo = SIMD4<Float>(
+      Float(texture.width) / Float(max(1, texture.height)),
+      profile.seed,
+      profile.tilt,
+      profile.turbulence
+    )
+    var physics = SIMD4<Float>(
+      combustionProfile.ignitionThreshold,
+      combustionProfile.moistureResistance,
+      combustionProfile.evaporationRate,
+      combustionProfile.fuelBurnRate
+    )
+    var dynamics = SIMD4<Float>(
+      combustionProfile.heatDecay,
+      combustionProfile.spreadRate,
+      combustionProfile.heatRelease,
+      combustionProfile.maximumHeat
+    )
+
+    stepEncoder.setComputePipelineState(stepCombustionPipeline)
+    stepEncoder.setTexture(
+      combustionStateTextures[currentCombustionTextureIndex],
+      index: 0
+    )
+    stepEncoder.setTexture(wetAccumulationTexture, index: 1)
+    stepEncoder.setTexture(combustionStateTextures[nextCombustionTextureIndex], index: 2)
+    ignitionUniforms.withUnsafeBytes { bytes in
+      guard let baseAddress = bytes.baseAddress else { return }
+      stepEncoder.setBytes(baseAddress, length: bytes.count, index: 0)
+    }
+    stepEncoder.setBytes(&timing, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+    stepEncoder.setBytes(&mode, length: MemoryLayout<SIMD4<Float>>.stride, index: 2)
+    stepEncoder.setBytes(&fieldInfo, length: MemoryLayout<SIMD4<Float>>.stride, index: 3)
+    stepEncoder.setBytes(&physics, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
+    stepEncoder.setBytes(&dynamics, length: MemoryLayout<SIMD4<Float>>.stride, index: 5)
+    stepEncoder.dispatchThreads(
+      MTLSize(
+        width: combustionStateTextures[nextCombustionTextureIndex].width,
+        height: combustionStateTextures[nextCombustionTextureIndex].height,
+        depth: 1
+      ),
+      threadsPerThreadgroup: computeThreadgroupSize(for: stepCombustionPipeline)
+    )
+    stepEncoder.endEncoding()
+    currentCombustionTextureIndex = nextCombustionTextureIndex
+    return true
+  }
+
   private func computeThreadgroupSize(
     for pipeline: MTLComputePipelineState
   ) -> MTLSize {
     let width = pipeline.threadExecutionWidth
     let height = max(1, pipeline.maxTotalThreadsPerThreadgroup / width)
     return MTLSize(width: width, height: height, depth: 1)
+  }
+
+  private static func pipelineResources(for device: MTLDevice) throws -> PipelineResources {
+    if let cached = pipelineResourcesByRegistryID[device.registryID] {
+      return cached
+    }
+
+    let library: MTLLibrary
+    do {
+      library = try device.makeLibrary(source: shaderSource, options: nil)
+    } catch {
+      throw BurnRendererError.shaderCompilation(error.localizedDescription)
+    }
+    guard
+      let vertexFunction = library.makeFunction(name: "burnVertex"),
+      let fragmentFunction = library.makeFunction(name: "burnFragment"),
+      let clearWetFunction = library.makeFunction(name: "clearWetField"),
+      let accumulateWetFunction = library.makeFunction(name: "accumulateWetField"),
+      let initializeCombustionFunction = library.makeFunction(name: "initializeCombustionField"),
+      let stepCombustionFunction = library.makeFunction(name: "stepCombustionField")
+    else {
+      throw BurnRendererError.shaderFunction
+    }
+
+    let descriptor = MTLRenderPipelineDescriptor()
+    descriptor.vertexFunction = vertexFunction
+    descriptor.fragmentFunction = fragmentFunction
+    descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
+    descriptor.colorAttachments[0].isBlendingEnabled = true
+    descriptor.colorAttachments[0].rgbBlendOperation = .add
+    descriptor.colorAttachments[0].alphaBlendOperation = .add
+    descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+    descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+    descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+    descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+
+    do {
+      let resources = PipelineResources(
+        render: try device.makeRenderPipelineState(descriptor: descriptor),
+        clearWet: try device.makeComputePipelineState(function: clearWetFunction),
+        accumulateWet: try device.makeComputePipelineState(function: accumulateWetFunction),
+        initializeCombustion: try device.makeComputePipelineState(
+          function: initializeCombustionFunction
+        ),
+        stepCombustion: try device.makeComputePipelineState(
+          function: stepCombustionFunction
+        )
+      )
+      pipelineResourcesByRegistryID[device.registryID] = resources
+      return resources
+    } catch {
+      throw BurnRendererError.pipeline(error.localizedDescription)
+    }
   }
 
   private static let shaderSource = #"""
@@ -628,11 +799,154 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         wetField.write(float4(min(density, 64.0), 0.0, 0.0, 1.0), position);
     }
 
+    kernel void initializeCombustionField(
+        texture2d<float, access::read> wetField [[texture(0)]],
+        texture2d<float, access::write> combustionState [[texture(1)]],
+        uint2 position [[thread_position_in_grid]]
+    ) {
+        if (position.x >= combustionState.get_width()
+            || position.y >= combustionState.get_height()) {
+            return;
+        }
+
+        float wetDensity = wetField.read(position).r;
+        float moisture = clamp(log2(1.0 + max(0.0, wetDensity)) * 0.32, 0.0, 1.0);
+        combustionState.write(float4(0.0, moisture, 1.0, 0.0), position);
+    }
+
+    kernel void stepCombustionField(
+        texture2d<float, access::read> currentState [[texture(0)]],
+        texture2d<float, access::read> wetField [[texture(1)]],
+        texture2d<float, access::write> nextState [[texture(2)]],
+        constant float4 *ignitions [[buffer(0)]],
+        constant float4 &timing [[buffer(1)]],
+        constant float4 &mode [[buffer(2)]],
+        constant float4 &fieldInfo [[buffer(3)]],
+        constant float4 &physics [[buffer(4)]],
+        constant float4 &dynamics [[buffer(5)]],
+        uint2 position [[thread_position_in_grid]]
+    ) {
+        if (position.x >= nextState.get_width()
+            || position.y >= nextState.get_height()) {
+            return;
+        }
+
+        uint2 left = uint2(max(int(position.x) - 1, 0), position.y);
+        uint2 right = uint2(min(position.x + 1, currentState.get_width() - 1), position.y);
+        uint2 above = uint2(position.x, max(int(position.y) - 1, 0));
+        uint2 below = uint2(position.x, min(position.y + 1, currentState.get_height() - 1));
+        float4 state = currentState.read(position);
+        float neighborHeat = (
+            currentState.read(left).r
+            + currentState.read(right).r
+            + currentState.read(above).r
+            + currentState.read(below).r * 1.35
+        ) / 4.35;
+
+        float2 fieldSize = float2(nextState.get_width(), nextState.get_height());
+        float2 uv = (float2(position) + 0.5) / fieldSize;
+        float progress = timing.x;
+        float time = timing.y;
+        float burnDuration = max(timing.z, 0.001);
+        float deltaTime = clamp(timing.w, 0.0, 1.0 / 15.0);
+        float effectMode = mode.x;
+        uint ignitionCount = uint(mode.y);
+        float aspect = fieldInfo.x;
+        float seed = fieldInfo.y;
+        float tilt = fieldInfo.z;
+        float turbulence = fieldInfo.w;
+        float2 seedOffset = float2(seed * 0.0137, seed * 0.0319);
+
+        float sourceHeat = 0.0;
+        if (effectMode < 0.5) {
+            float coarse = fbm(float2(uv.x * 6.4 * turbulence, seedOffset.x));
+            float detail = valueNoise(float2(uv.x * 41.0, seedOffset.y));
+            float fibers = sin(uv.x * (71.0 + seed * 0.003) + seed) * 0.5 + 0.5;
+            float ragged = (coarse - 0.5) * 0.19 * turbulence
+                + (detail - 0.5) * 0.052
+                + (fibers - 0.5) * 0.016;
+            float front = progress * 1.24 - 0.12
+                + tilt * (uv.x - 0.5)
+                + sin(uv.x * 3.14159265) * 0.055
+                + ragged;
+            float frontHeat = 1.0 - smoothstep(0.012, 0.060, abs(uv.y - front));
+            float passedFront = 1.0 - step(front - 0.025, uv.y);
+            sourceHeat = max(frontHeat, passedFront * 0.34 * (1.0 - state.a));
+        } else if (ignitionCount > 0) {
+            float maximumRadius = length(float2(aspect, 1.0)) + 0.12;
+            for (uint index = 0; index < ignitionCount; index++) {
+                float4 ignition = ignitions[index];
+                float age = max(0.0, time - ignition.z);
+                float ignitionProgress = clamp(age / burnDuration, 0.0, 1.0);
+                float radius = ignitionProgress * maximumRadius;
+                float distance = length((uv - ignition.xy) * float2(aspect, 1.0));
+                float frontHeat = 1.0 - smoothstep(0.012, 0.060, abs(distance - radius));
+                float passedFront = 1.0 - smoothstep(
+                    max(0.0, radius - 0.065),
+                    radius,
+                    distance
+                );
+                sourceHeat = max(
+                    sourceHeat,
+                    max(frontHeat, passedFront * 0.34 * (1.0 - state.a))
+                );
+            }
+        }
+
+        float ignitionThreshold = physics.x;
+        float moistureResistance = physics.y;
+        float evaporationRate = physics.z;
+        float fuelBurnRate = physics.w;
+        float heatDecay = dynamics.x;
+        float spreadRate = dynamics.y;
+        float heatRelease = dynamics.z;
+        float maximumHeat = dynamics.w;
+
+        float heat = clamp(state.r, 0.0, maximumHeat);
+        float moisture = clamp(state.g, 0.0, 1.0);
+        float fuel = clamp(state.b, 0.0, 1.0);
+        float damage = clamp(state.a, 0.0, 1.0);
+        if (mode.z > 0.5) {
+            float depositedMoisture = clamp(
+                log2(1.0 + max(0.0, wetField.read(position).r)) * 0.32,
+                0.0,
+                1.0
+            );
+            moisture = max(moisture, depositedMoisture);
+        }
+
+        float retainedHeat = heat * max(0.0, 1.0 - heatDecay * deltaTime);
+        float spreadHeat = clamp(neighborHeat, 0.0, maximumHeat) * spreadRate;
+        float nextHeat = min(
+            max(max(retainedHeat, spreadHeat), max(sourceHeat, 0.0)),
+            maximumHeat
+        );
+        float evaporatedMoisture = min(
+            moisture,
+            nextHeat * evaporationRate * deltaTime
+        );
+        float nextMoisture = moisture - evaporatedMoisture;
+        float combustibleHeat = max(
+            0.0,
+            nextHeat - ignitionThreshold - nextMoisture * moistureResistance
+        );
+        float burnedFuel = min(fuel, combustibleHeat * fuelBurnRate * deltaTime);
+        float nextFuel = fuel - burnedFuel;
+        nextHeat = min(nextHeat + burnedFuel * heatRelease, maximumHeat);
+        float nextDamage = max(damage, 1.0 - nextFuel);
+
+        nextState.write(
+            float4(nextHeat, nextMoisture, nextFuel, nextDamage),
+            position
+        );
+    }
+
     fragment float4 burnFragment(
         VertexOut input [[stage_in]],
         texture2d<float> image [[texture(0)]],
         texture2d<float> wetField [[texture(1)]],
         texture2d<float> backdrop [[texture(2)]],
+        texture2d<float> combustionState [[texture(3)]],
         sampler imageSampler [[sampler(0)]],
         constant float2 &timing [[buffer(0)]],
         constant float2 &padding [[buffer(1)]],
@@ -687,6 +1001,13 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
 
         float horizontalMask = step(0.0, imageUV.x) * step(imageUV.x, 1.0);
         float insideMask = horizontalMask * step(0.0, imageUV.y) * step(imageUV.y, 1.0);
+        float4 combustion = combustionState.sample(
+            imageSampler,
+            clamp(imageUV, 0.0, 1.0)
+        );
+        float combustionHeat = combustion.r * insideMask;
+        float combustionMoisture = combustion.g * insideMask;
+        float combustionDamage = combustion.a * insideMask;
 
         float2 seedOffset = float2(seed * 0.0137, seed * 0.0319);
         float coarse = fbm(float2(imageUV.x * 6.4 * turbulence, seedOffset.x));
@@ -742,6 +1063,14 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             -hotCoreWidth * 0.55,
             hotCoreWidth * 1.65,
             signedDistance + edgeBreakup
+        );
+        float stateKeep = 1.0 - smoothstep(0.50, 0.98, combustionDamage);
+        keep = max(keep, stateKeep);
+        float stateScorch = smoothstep(0.06, 0.34, combustionDamage)
+            * (1.0 - smoothstep(0.72, 0.98, combustionDamage));
+        scorchBand = max(
+            scorchBand,
+            stateScorch * insideMask * (0.62 + grain * 0.38)
         );
         float2 sourceUV = imageUV;
         float wetMask = 0.0;
@@ -1388,6 +1717,13 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             * combustibleMask;
         float edgeDistance = abs(signedDistance);
         float burnedDistance = max(0.0, -signedDistance);
+        float pixelSpan = max(fwidth(signedDistance), 0.00025);
+        hotCoreWidth = clamp(hotCoreWidth, pixelSpan * 1.5, pixelSpan * 5.0);
+        float combustionActivity = smoothstep(0.10, 0.72, combustionHeat)
+            * (1.0 - smoothstep(0.88, 1.0, combustionDamage));
+        float moistureDamping = 1.0
+            - smoothstep(0.18, 0.96, combustionMoisture) * 0.78;
+        effectMask *= max(0.055, combustionActivity) * moistureDamping;
         float edgeFlicker = 0.58 + 0.42 * valueNoise(float2(
             imageUV.x * 127.0 + seedOffset.y,
             time * 17.0 + seedOffset.x
@@ -1541,6 +1877,15 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 imageUV.x * 5.0 + time * 0.25 + seedOffset.x,
                 imageUV.y * 4.0 - time * 0.34 + seedOffset.y
             )));
+        float steamNoise = fbm(float2(
+            imageUV.x * 7.0 + time * 0.18 + seedOffset.y,
+            imageUV.y * 6.0 - time * 0.72 + seedOffset.x
+        ));
+        float steam = insideMask
+            * smoothstep(0.08, 0.78, combustionHeat)
+            * smoothstep(0.04, 0.82, combustionMoisture)
+            * (1.0 - smoothstep(0.86, 1.0, combustionDamage))
+            * (0.035 + steamNoise * 0.11);
 
         float fireAlpha = max(
             glow * 0.32,
@@ -1550,11 +1895,12 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             + orange * emberEdge * 1.05
             + flameColor * flame * 1.58
             + hotWhite * hotCore * 1.95;
-        float outputAlpha = max(source.a, max(fireAlpha, max(spark, smoke)));
+        float outputAlpha = max(source.a, max(fireAlpha, max(spark, max(smoke, steam))));
         float3 outputRGB = source.rgb * source.a
             + fireRGB
             + float3(1.0, 0.48, 0.045) * spark * 2.20
-            + float3(0.10, 0.075, 0.068) * smoke;
+            + float3(0.10, 0.075, 0.068) * smoke
+            + float3(0.72, 0.76, 0.74) * steam;
 
         outputRGB = outputAlpha > 0.0 ? outputRGB / outputAlpha : 0.0;
         return float4(outputRGB, outputAlpha);
