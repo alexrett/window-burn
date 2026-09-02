@@ -25,4 +25,36 @@ struct WindowControlIntentTests {
       WindowControlClassifier.classify(role: "AXGroup", subrole: "AXCloseButton") == nil
     )
   }
+
+  @Test("Leaves close buttons without a window-level close action to macOS")
+  func requiresSupportedWindowCloseAction() {
+    #expect(
+      WindowControlInterceptionPolicy.shouldIntercept(
+        kind: .close,
+        windowExposesCloseButton: true
+      )
+    )
+    #expect(
+      !WindowControlInterceptionPolicy.shouldIntercept(
+        kind: .close,
+        windowExposesCloseButton: false
+      )
+    )
+  }
+
+  @Test("Replays the native action silently when the effect fails before closing")
+  func replaysNativeCloseBeforeCloseRequest() {
+    #expect(
+      WindowControlInterceptionPolicy.recovery(didRequestClose: false)
+        == .replayNativeActionSilently
+    )
+  }
+
+  @Test("Leaves an existing native close flow in place without showing an error")
+  func preservesNativeCloseFlowAfterCloseRequest() {
+    #expect(
+      WindowControlInterceptionPolicy.recovery(didRequestClose: true)
+        == .leaveNativeCloseFlowInPlaceSilently
+    )
+  }
 }
