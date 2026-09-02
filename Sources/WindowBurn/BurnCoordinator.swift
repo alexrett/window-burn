@@ -89,7 +89,7 @@ final class BurnCoordinator {
 
     Task { @MainActor [weak self] in
       guard let self else { return }
-      var actionPerformed = false
+      var didRequestClose = false
 
       do {
         let capturedWindow = try await WindowCaptureService.capture(
@@ -112,8 +112,11 @@ final class BurnCoordinator {
           onFirstFrame: nil,
           completion: { [weak self] in self?.isBusy = false }
         )
-        actionPerformed = true
-        try await AccessibilityWindowService.closeDiscardingUnsavedChanges(control.window)
+        try AccessibilityWindowService.perform(control)
+        didRequestClose = true
+        try await AccessibilityWindowService.finishClosingDiscardingUnsavedChanges(
+          control.window
+        )
         guard overlay.activateReplacementSurface() else {
           throw BurnOverlayError.rendererUnavailable
         }
@@ -123,7 +126,10 @@ final class BurnCoordinator {
         )
       } catch {
         overlay.dismiss()
-        if !actionPerformed {
+        switch WindowControlInterceptionPolicy.recovery(
+          didRequestClose: didRequestClose
+        ) {
+        case .replayNativeActionSilently:
           do {
             try AccessibilityWindowService.perform(control)
           } catch {
@@ -131,13 +137,13 @@ final class BurnCoordinator {
               "Fallback \(control.kind.logName, privacy: .public) action failed: \(error.localizedDescription, privacy: .public)"
             )
           }
+        case .leaveNativeCloseFlowInPlaceSilently:
+          break
         }
         isBusy = false
-        onDestructiveCloseFailure?()
-        logger.error(
-          "Intercepted \(control.kind.logName, privacy: .public) burn failed: \(error.localizedDescription, privacy: .public)"
+        logger.notice(
+          "Passed intercepted \(control.kind.logName, privacy: .public) action back to macOS after the burn was skipped: \(error.localizedDescription, privacy: .public)"
         )
-        showError(error)
       }
     }
 

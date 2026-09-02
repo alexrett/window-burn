@@ -97,6 +97,13 @@ enum AccessibilityWindowService {
     _ window: AccessibleWindow
   ) async throws {
     try close(window)
+    try await finishClosingDiscardingUnsavedChanges(window)
+  }
+
+  @MainActor
+  static func finishClosingDiscardingUnsavedChanges(
+    _ window: AccessibleWindow
+  ) async throws {
     var didRequestDiscard = false
     var sawUnsupportedSheet = false
 
@@ -146,11 +153,22 @@ enum AccessibilityWindowService {
     else {
       return nil
     }
+    let closeButtonValue = copyAttribute(kAXCloseButtonAttribute, from: window.element)
+    guard
+      WindowControlInterceptionPolicy.shouldIntercept(
+        kind: kind,
+        windowExposesCloseButton: closeButtonValue != nil
+      ),
+      let closeButtonValue
+    else {
+      return nil
+    }
+    let closeButton = unsafeDowncast(closeButtonValue, to: AXUIElement.self)
 
     return AccessibleWindowControl(
       window: window,
       kind: kind,
-      button: hitElement
+      button: closeButton
     )
   }
 

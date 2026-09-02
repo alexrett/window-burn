@@ -15,6 +15,29 @@ public enum WindowControlClassifier {
   }
 }
 
+public enum WindowControlInterceptionRecovery: Equatable, Sendable {
+  case replayNativeActionSilently
+  case leaveNativeCloseFlowInPlaceSilently
+}
+
+public enum WindowControlInterceptionPolicy {
+  public static func shouldIntercept(
+    kind: WindowControlKind,
+    windowExposesCloseButton: Bool
+  ) -> Bool {
+    switch kind {
+    case .close:
+      windowExposesCloseButton
+    }
+  }
+
+  public static func recovery(didRequestClose: Bool) -> WindowControlInterceptionRecovery {
+    didRequestClose
+      ? .leaveNativeCloseFlowInPlaceSilently
+      : .replayNativeActionSilently
+  }
+}
+
 extension WindowControlKind {
   public var logName: String {
     switch self {
