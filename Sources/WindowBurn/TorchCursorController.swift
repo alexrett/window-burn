@@ -30,8 +30,8 @@ final class TorchCursorController {
   private var cursorView: EffectCursorView?
   private var timer: Timer?
   private var didHideSystemCursor = false
-  private var isTemporarilyHidden = false
-  private var isTrackingPointerDrag = false
+  private var lastArtworkUpdate: TimeInterval = 0
+  var pointerLocation: (() -> CGPoint?)?
   private(set) var style: EffectCursorStyle?
   var isEnabled: Bool { style != nil }
   var captureWindowIDs: Set<CGWindowID> {
@@ -48,36 +48,13 @@ final class TorchCursorController {
     self.style = style
 
     guard let style else {
-      isTrackingPointerDrag = false
       hide()
       return
     }
 
     cursorView?.style = style
     panel?.setContentSize(style.size)
-    guard !isTemporarilyHidden else { return }
     show()
-  }
-
-  func setTemporarilyHidden(_ hidden: Bool) {
-    guard hidden != isTemporarilyHidden else { return }
-    isTemporarilyHidden = hidden
-    if hidden {
-      hide()
-    } else if style != nil {
-      show()
-    }
-  }
-
-  func withoutOverlay<Result>(_ operation: () -> Result) -> Result {
-    panel?.orderOut(nil)
-    defer {
-      if isEnabled, !isTemporarilyHidden {
-        updatePosition()
-        panel?.orderFrontRegardless()
-      }
-    }
-    return operation()
   }
 
   func move(toQuartzPoint point: CGPoint) {
@@ -88,18 +65,8 @@ final class TorchCursorController {
     move(toAppKitPoint: appKitPoint)
   }
 
-  func beginPointerDrag(atQuartzPoint point: CGPoint) {
-    isTrackingPointerDrag = true
-    move(toQuartzPoint: point)
-  }
-
-  func endPointerDrag(atQuartzPoint point: CGPoint) {
-    move(toQuartzPoint: point)
-    isTrackingPointerDrag = false
-  }
-
   private func show() {
-    guard let style, !isTemporarilyHidden else { return }
+    guard let style else { return }
 
     if panel == nil {
       let panel = NSPanel(
@@ -138,7 +105,7 @@ final class TorchCursorController {
 
     if timer == nil {
       let timer = Timer(
-        timeInterval: 1.0 / 30.0,
+        timeInterval: 1.0 / 60.0,
         target: self,
         selector: #selector(updatePosition),
         userInfo: nil,
@@ -160,27 +127,28 @@ final class TorchCursorController {
   }
 
   @objc private func updatePosition() {
-    if !isTrackingPointerDrag {
-      move(toAppKitPoint: NSEvent.mouseLocation)
+    if let point = pointerLocation?() {
+      move(toQuartzPoint: point)
     } else {
-      updateArtwork()
+      move(toAppKitPoint: NSEvent.mouseLocation)
     }
   }
 
   private func move(toAppKitPoint point: CGPoint) {
     guard let style else { return }
-    panel?.setFrameOrigin(
-      CGPoint(
-        x: point.x - style.hotSpot.x,
-        y: point.y - style.hotSpot.y
-      )
-    )
+    let origin = CGPoint(x: point.x - style.hotSpot.x, y: point.y - style.hotSpot.y)
+    if panel?.frame.origin != origin { panel?.setFrameOrigin(origin) }
     InputDiagnostics.cursorMoved(point: point)
     updateArtwork()
   }
 
   private func updateArtwork() {
-    cursorView?.animationTime = ProcessInfo.processInfo.systemUptime
+    // The idle badge is static. Artwork animates at 30 Hz; pointer motion stays at 60 Hz.
+    guard style != .adultBadge(isSoaking: false) else { return }
+    let now = ProcessInfo.processInfo.systemUptime
+    guard now - lastArtworkUpdate >= 1.0 / 30.0 else { return }
+    lastArtworkUpdate = now
+    cursorView?.animationTime = now
     cursorView?.needsDisplay = true
   }
 }

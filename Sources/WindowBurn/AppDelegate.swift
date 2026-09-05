@@ -58,9 +58,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     coordinator.onSoakAndBurnPhaseChange = { [weak self] phase in
       self?.updateSoakAndBurnCursor(for: phase)
     }
-    coordinator.onSoakCaptureStateChange = { [weak self] isCapturing in
-      self?.torchCursor.setTemporarilyHidden(isCapturing)
-    }
     coordinator.onDestructiveCloseFailure = { [weak self] in
       self?.disableInteractiveModesAfterCloseFailure()
     }
@@ -224,32 +221,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closeHandler: { [weak self] control in
           self?.coordinator.interceptWindowControl(control) ?? false
         },
-        torchHandler: { [weak self] location in
-          guard let self else { return false }
-          return torchCursor.withoutOverlay {
-            coordinator.interceptTorchClick(at: location)
-          }
+        torchHandler: { [weak self] location, window in
+          self?.coordinator.interceptTorchClick(
+            at: location, resolvedWindow: window
+          ) ?? false
         },
-        soakAndBurnHandler: { [weak self] event, location in
-          guard let self else { return false }
-          switch event {
-          case .down:
-            break
-          case .dragged:
-            torchCursor.move(toQuartzPoint: location)
-          case .up:
-            torchCursor.endPointerDrag(atQuartzPoint: location)
-          }
-          if case .down = event {
-            let accepted = torchCursor.withoutOverlay {
-              coordinator.interceptSoakAndBurn(event, at: location)
-            }
-            if accepted { torchCursor.beginPointerDrag(atQuartzPoint: location) }
-            return accepted
-          }
-          return coordinator.interceptSoakAndBurn(event, at: location)
+        soakAndBurnHandler: { [weak self] event, location, window in
+          self?.coordinator.interceptSoakAndBurn(
+            event, at: location, resolvedWindow: window
+          ) ?? false
         }
       )
+      windowControlInterceptor?.interactionState = { [weak self] in
+        self?.coordinator.pointerInteractionState ?? ([], false)
+      }
+      torchCursor.pointerLocation = { [weak self] in
+        self?.windowControlInterceptor?.latestPointerLocation
+      }
     } catch {
       logger.error(
         "Mouse interception is unavailable: \(error.localizedDescription, privacy: .public)"

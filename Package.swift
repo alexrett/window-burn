@@ -27,5 +27,6 @@ let package = Package(
       ]
     ),
     .testTarget(name: "WindowBurnCoreTests", dependencies: ["WindowBurnCore"]),
+    .testTarget(name: "WindowBurnInputTests", dependencies: ["WindowBurn", "WindowBurnCore"]),
   ]
 )

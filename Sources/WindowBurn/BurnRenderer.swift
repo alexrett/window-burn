@@ -54,6 +54,9 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   }
 
   private let commandQueue: MTLCommandQueue
+  // Acquired before touching currentDrawable, which otherwise waits on the main thread
+  // when the GPU has exhausted CAMetalLayer's drawable pool.
+  private let inFlightFrame = DispatchSemaphore(value: 1)
   private let pipeline: MTLRenderPipelineState
   private let clearWetPipeline: MTLComputePipelineState
   private let accumulateWetPipeline: MTLComputePipelineState
@@ -88,10 +91,11 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   private var burnStartedAt: TimeInterval?
   private var isHandoffPrepared = false
   private var isReplacementSurfaceActive = false
-  private var shouldSynchronizeNextFrame = false
   private var hasCompleted = false
   private var presentationContinuation: CheckedContinuation<Void, Error>?
   private var presentationID: UUID?
+  private var submittedPresentationID: UUID?
+  private weak var presentationView: MTKView?
   private var presentationTimeout: Task<Void, Never>?
 
   /// A fixed clock for the reproducible visual preview. Normal interactions use the display clock.
@@ -228,13 +232,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     lastDrawTime = now
   }
 
-  func synchronizeNextFrame() {
-    shouldSynchronizeNextFrame = true
-  }
-
   func activateReplacementSurface() {
     isReplacementSurfaceActive = true
-    shouldSynchronizeNextFrame = true
   }
 
   func setHandoffImage(_ image: CGImage?) throws {
@@ -294,6 +293,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       presentationID = id
       presentationContinuation = continuation
+      presentationView = view
       presentationTimeout = Task { @MainActor [weak self] in
         try? await Task.sleep(for: .seconds(1))
         guard !Task.isCancelled else { return }
@@ -310,6 +310,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     guard id == presentationID, let continuation = presentationContinuation else { return }
     presentationContinuation = nil
     presentationID = nil
+    submittedPresentationID = nil
+    presentationView = nil
     presentationTimeout?.cancel()
     presentationTimeout = nil
     if let error {
@@ -319,11 +321,21 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     }
   }
 
+  private func retryPendingPresentation() {
+    guard
+      presentationContinuation != nil,
+      submittedPresentationID == nil,
+      let view = presentationView
+    else { return }
+    // A paused first-frame or handoff view has no display-link tick to retry a
+    // draw skipped while the previous GPU frame was still in flight.
+    view.draw()
+  }
+
   @discardableResult
   func prepareForIgnitionHandoff() -> Bool {
     guard case .soakAndBurn = style, burnStartedAt == nil else { return false }
     isHandoffPrepared = true
-    shouldSynchronizeNextFrame = true
     return true
   }
 
@@ -366,6 +378,11 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
 
   func draw(in view: MTKView) {
     guard !hasCompleted else { return }
+    guard inFlightFrame.wait(timeout: .now()) == .success else { return }
+    var didSubmitFrame = false
+    defer {
+      if !didSubmitFrame { inFlightFrame.signal() }
+    }
     let drawableRequestedAt = CACurrentMediaTime()
     let nextDrawable = view.currentDrawable
     InputDiagnostics.drawableWait(CACurrentMediaTime() - drawableRequestedAt)
@@ -626,15 +643,19 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     )
     encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
     encoder.endEncoding()
-    let pendingPresentationID = presentationID
+    let pendingPresentationID = submittedPresentationID == nil ? presentationID : nil
     if let pendingPresentationID {
+      submittedPresentationID = pendingPresentationID
       drawable.addPresentedHandler { [weak self] _ in
         Task { @MainActor in
           self?.finishPresentation(id: pendingPresentationID)
         }
       }
     }
-    commandBuffer.addCompletedHandler { [weak self] buffer in
+    commandBuffer.addCompletedHandler { [weak self, inFlightFrame] buffer in
+      // Release on Metal's completion queue; waiting for MainActor here would
+      // prevent a busy UI from making rendering progress.
+      inFlightFrame.signal()
       let duration = max(0, buffer.gpuEndTime - buffer.gpuStartTime)
       let failure = buffer.status == .error ? buffer.error?.localizedDescription : nil
       Task { @MainActor in
@@ -645,14 +666,12 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             error: BurnRendererError.presentation(failure)
           )
         }
+        self?.retryPendingPresentation()
       }
     }
     commandBuffer.present(drawable)
+    didSubmitFrame = true
     commandBuffer.commit()
-    if shouldSynchronizeNextFrame {
-      commandBuffer.waitUntilCompleted()
-      shouldSynchronizeNextFrame = false
-    }
 
     let canComplete: Bool = {
       if case .soakAndBurn = style { return burnStartedAt != nil }

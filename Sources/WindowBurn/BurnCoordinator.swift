@@ -33,9 +33,16 @@ final class BurnCoordinator {
   private var soakGeneration = 0
   private var soakCloseTask: Task<Void, Never>?
   var onSoakAndBurnPhaseChange: ((SoakAndBurnPhase) -> Void)?
-  var onSoakCaptureStateChange: ((Bool) -> Void)?
   var onDestructiveCloseFailure: (() -> Void)?
   var excludedCaptureWindowIDs: (() -> Set<CGWindowID>)?
+
+  private let soakSurfaceID = UUID()
+  var pointerInteractionState: (surfaces: [PointerTargetSnapshot.Region], canStart: Bool) {
+    if let soakCaptureFrame {
+      return ([.init(id: soakSurfaceID, frame: soakCaptureFrame)], false)
+    }
+    return (torchSessionRegistry.interactionRegions, !isBusy && !torchSessionRegistry.isAtCapacity)
+  }
 
   func burnFrontWindow() {
     guard !isBusy, torchSessions.isEmpty else { return }
@@ -153,7 +160,9 @@ final class BurnCoordinator {
     return true
   }
 
-  func interceptTorchClick(at screenPoint: CGPoint) -> Bool {
+  func interceptTorchClick(
+    at screenPoint: CGPoint, resolvedWindow: AccessibleWindow?
+  ) -> Bool {
     if let sessionID = torchSessionRegistry.sessionID(containing: screenPoint),
       let session = torchSessions[sessionID],
       let ignition = TorchBurnGeometry.normalizedIgnition(
@@ -187,7 +196,7 @@ final class BurnCoordinator {
 
     guard
       !isBusy,
-      let accessibleWindow = AccessibilityWindowService.window(at: screenPoint),
+      let accessibleWindow = resolvedWindow,
       TorchBurnGeometry.normalizedIgnition(
         screenPoint: screenPoint,
         captureFrame: accessibleWindow.target.frame
@@ -297,13 +306,14 @@ final class BurnCoordinator {
 
   func interceptSoakAndBurn(
     _ event: SoakAndBurnPointerEvent,
-    at screenPoint: CGPoint
+    at screenPoint: CGPoint, resolvedWindow: AccessibleWindow?
   ) -> Bool {
     switch event {
     case .down:
       switch soakAndBurnSession.phase {
       case .readyToSoak:
-        return beginSoaking(at: screenPoint)
+        return beginSoaking(
+          at: screenPoint, resolvedWindow: resolvedWindow)
       case .readyToBurn:
         return igniteSoakedWindow(at: screenPoint)
       case .soaking, .burning:
@@ -449,11 +459,13 @@ final class BurnCoordinator {
     )
   }
 
-  private func beginSoaking(at screenPoint: CGPoint) -> Bool {
+  private func beginSoaking(
+    at screenPoint: CGPoint, resolvedWindow: AccessibleWindow?
+  ) -> Bool {
     guard
       !isBusy,
       torchSessions.isEmpty,
-      let accessibleWindow = AccessibilityWindowService.window(at: screenPoint),
+      let accessibleWindow = resolvedWindow,
       TorchBurnGeometry.normalizedIgnition(
         screenPoint: screenPoint,
         captureFrame: accessibleWindow.target.frame
@@ -478,7 +490,6 @@ final class BurnCoordinator {
     isSoakOverlayActive = false
     pendingSoakRelease = false
     notifySoakAndBurnPhaseChange()
-    onSoakCaptureStateChange?(true)
 
     Task { @MainActor [weak self] in
       guard let self else { return }
@@ -529,7 +540,6 @@ final class BurnCoordinator {
         }
         pendingSoakTrail = SoakTrail()
         isSoakOverlayActive = true
-        onSoakCaptureStateChange?(false)
         if pendingSoakRelease || soakAndBurnSession.phase == .readyToBurn {
           pendingSoakRelease = false
           _ = overlay.finishSoaking()
@@ -569,7 +579,6 @@ final class BurnCoordinator {
     soakCloseTask = Task { @MainActor [weak self] in
       guard let self else { return }
       do {
-        onSoakCaptureStateChange?(true)
         guard generation == soakGeneration, !Task.isCancelled else { return }
         let handoffImage = await WindowCaptureService.captureHandoff(
           targetFrame: captureFrame,
@@ -598,7 +607,6 @@ final class BurnCoordinator {
           return
         }
         soakCloseTask = nil
-        onSoakCaptureStateChange?(false)
         notifySoakAndBurnPhaseChange()
         logger.info(
           "Ignited the soaked window for pid \(accessibleWindow.target.ownerPID) at \(ignition.x, format: .fixed(precision: 2)), \(ignition.y, format: .fixed(precision: 2))"
@@ -648,7 +656,6 @@ final class BurnCoordinator {
   private func resetSoakAndBurn() {
     soakCloseTask?.cancel()
     soakCloseTask = nil
-    onSoakCaptureStateChange?(false)
     soakGeneration += 1
     isBusy = false
     soakAndBurnSession.reset()

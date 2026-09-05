@@ -58,6 +58,10 @@ public struct TorchWindowSessionRegistry: Equatable, Sendable {
     entries.count
   }
 
+  public var interactionRegions: [PointerTargetSnapshot.Region] {
+    entries.reversed().map { .init(id: $0.id, frame: $0.captureFrame) }
+  }
+
   public var isAtCapacity: Bool {
     count >= Self.maximumConcurrentWindows
   }
