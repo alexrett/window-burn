@@ -9,6 +9,7 @@ enum BurnRendererError: LocalizedError {
   case pipeline(String)
   case texture(String)
   case sampler
+  case presentation(String)
 
   var errorDescription: String? {
     switch self {
@@ -24,6 +25,8 @@ enum BurnRendererError: LocalizedError {
       "The captured window could not become a Metal texture: \(message)"
     case .sampler:
       "Metal could not create a texture sampler."
+    case .presentation(let message):
+      "The captured window was not presented: \(message)"
     }
   }
 }
@@ -46,6 +49,10 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
 
   private static var pipelineResourcesByRegistryID: [UInt64: PipelineResources] = [:]
 
+  static func prewarm(device: MTLDevice) throws {
+    _ = try pipelineResources(for: device)
+  }
+
   private let commandQueue: MTLCommandQueue
   private let pipeline: MTLRenderPipelineState
   private let clearWetPipeline: MTLComputePipelineState
@@ -53,6 +60,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   private let initializeCombustionPipeline: MTLComputePipelineState
   private let stepCombustionPipeline: MTLComputePipelineState
   private let texture: MTLTexture
+  private var handoffTexture: MTLTexture?
   private let backdropTexture: MTLTexture
   private let shadowTexture: MTLTexture
   private let wetAccumulationTexture: MTLTexture
@@ -82,12 +90,21 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   private var isReplacementSurfaceActive = false
   private var shouldSynchronizeNextFrame = false
   private var hasCompleted = false
+  private var presentationContinuation: CheckedContinuation<Void, Error>?
+  private var presentationID: UUID?
+  private var presentationTimeout: Task<Void, Never>?
+
+  /// A fixed clock for the reproducible visual preview. Normal interactions use the display clock.
+  var previewElapsedTime: TimeInterval?
+  private var previousPreviewElapsedTime: TimeInterval?
+  private(set) var lastGPUFrameDuration: TimeInterval = 0
 
   init(
     device: MTLDevice,
     image: CGImage,
     backdropImage: CGImage?,
     shadowImage: CGImage?,
+    handoffImage: CGImage? = nil,
     shadowSamplingOffset: CGPoint,
     profile: BurnProfile,
     style: BurnRendererStyle,
@@ -140,11 +157,11 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     let wetTextureWidth: Int
     let wetTextureHeight: Int
     if imageAspect >= 1 {
-      wetTextureWidth = 256
-      wetTextureHeight = max(64, Int((256 / imageAspect).rounded()))
+      wetTextureWidth = 512
+      wetTextureHeight = max(128, Int((512 / imageAspect).rounded()))
     } else {
-      wetTextureWidth = max(64, Int((256 * imageAspect).rounded()))
-      wetTextureHeight = 256
+      wetTextureWidth = max(128, Int((512 * imageAspect).rounded()))
+      wetTextureHeight = 512
     }
     let wetTextureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
       pixelFormat: .r16Float,
@@ -179,24 +196,14 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     }
     combustionStateTextures = [firstCombustionTexture, secondCombustionTexture]
 
-    let textureLoader = MTKTextureLoader(device: device)
-    let textureOptions: [MTKTextureLoader.Option: Any] = [
-      .origin: MTKTextureLoader.Origin.topLeft,
-      .SRGB: false,
-    ]
     do {
-      texture = try textureLoader.newTexture(
-        cgImage: image,
-        options: textureOptions
-      )
-      backdropTexture = try textureLoader.newTexture(
-        cgImage: backdropImage ?? image,
-        options: textureOptions
-      )
-      shadowTexture = try textureLoader.newTexture(
-        cgImage: shadowImage ?? image,
-        options: textureOptions
-      )
+      texture = try Self.makePremultipliedTexture(image: image, device: device)
+      backdropTexture = try Self.makePremultipliedTexture(
+        image: backdropImage ?? image, device: device)
+      shadowTexture = try Self.makePremultipliedTexture(image: shadowImage ?? image, device: device)
+      handoffTexture = try handoffImage.map {
+        try Self.makePremultipliedTexture(image: $0, device: device)
+      }
     } catch {
       throw BurnRendererError.texture(error.localizedDescription)
     }
@@ -228,6 +235,88 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   func activateReplacementSurface() {
     isReplacementSurfaceActive = true
     shouldSynchronizeNextFrame = true
+  }
+
+  func setHandoffImage(_ image: CGImage?) throws {
+    handoffTexture = try image.map {
+      try Self.makePremultipliedTexture(image: $0, device: texture.device)
+    }
+  }
+
+  private static func makePremultipliedTexture(image: CGImage, device: MTLDevice) throws
+    -> MTLTexture
+  {
+    let rowBytes = image.width * 4
+    // This must match ScreenCaptureKit and CAMetalLayer to avoid clipping native colors.
+    guard
+      let colorSpace = CGColorSpace(name: CGColorSpace.displayP3),
+      let context = CGContext(
+        data: nil,
+        width: image.width,
+        height: image.height,
+        bitsPerComponent: 8,
+        bytesPerRow: rowBytes,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+          | CGBitmapInfo.byteOrder32Big.rawValue
+      ),
+      let pixels = context.data
+    else { throw BurnRendererError.texture("the premultiplied image buffer could not be created") }
+    context.setBlendMode(.copy)
+    context.interpolationQuality = .none
+    context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+      pixelFormat: .rgba8Unorm,
+      width: image.width,
+      height: image.height,
+      mipmapped: false
+    )
+    descriptor.usage = .shaderRead
+    descriptor.storageMode = .shared
+    guard let texture = device.makeTexture(descriptor: descriptor) else {
+      throw BurnRendererError.texture("the premultiplied texture could not be created")
+    }
+    texture.replace(
+      region: MTLRegionMake2D(0, 0, image.width, image.height),
+      mipmapLevel: 0,
+      withBytes: pixels,
+      bytesPerRow: rowBytes
+    )
+    return texture
+  }
+
+  /// GPU completion alone does not mean the compositor has displayed the drawable.
+  func presentFrame(in view: MTKView) async throws {
+    guard presentationContinuation == nil else {
+      throw BurnRendererError.presentation("another presentation is still pending")
+    }
+    let id = UUID()
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      presentationID = id
+      presentationContinuation = continuation
+      presentationTimeout = Task { @MainActor [weak self] in
+        try? await Task.sleep(for: .seconds(1))
+        guard !Task.isCancelled else { return }
+        self?.finishPresentation(
+          id: id,
+          error: BurnRendererError.presentation("the display did not acknowledge the frame")
+        )
+      }
+      view.draw()
+    }
+  }
+
+  private func finishPresentation(id: UUID?, error: Error? = nil) {
+    guard id == presentationID, let continuation = presentationContinuation else { return }
+    presentationContinuation = nil
+    presentationID = nil
+    presentationTimeout?.cancel()
+    presentationTimeout = nil
+    if let error {
+      continuation.resume(throwing: error)
+    } else {
+      continuation.resume()
+    }
   }
 
   @discardableResult
@@ -281,11 +370,21 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       let drawable = view.currentDrawable,
       let renderPass = view.currentRenderPassDescriptor,
       let commandBuffer = commandQueue.makeCommandBuffer()
-    else { return }
+    else {
+      finishPresentation(
+        id: presentationID,
+        error: BurnRendererError.presentation("no drawable or command buffer is available")
+      )
+      return
+    }
 
     let now = CACurrentMediaTime()
-    let elapsed = startTime.map { now - $0 } ?? 0
-    let frameDuration = min(max(now - (lastDrawTime ?? now), 0), 1.0 / 15.0)
+    let elapsed = previewElapsedTime ?? startTime.map { now - $0 } ?? 0
+    let clockDelta =
+      previewElapsedTime.map { $0 - (previousPreviewElapsedTime ?? 0) }
+      ?? now - (lastDrawTime ?? now)
+    let frameDuration = isHandoffPrepared ? 0 : min(max(clockDelta, 0), 1.0 / 15.0)
+    previousPreviewElapsedTime = previewElapsedTime
     lastDrawTime = now
     var wetDeposits = wetDepositQueue.takePendingDeposits().map { point in
       SIMD4<Float>(
@@ -295,17 +394,20 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         0.34
       )
     }
-    if soakEndedAt == nil, let activePoint = wetDepositQueue.latestPoint {
+    if soakEndedAt == nil, frameDuration > 0, let activePoint = wetDepositQueue.latestPoint {
       wetDeposits.append(
         SIMD4<Float>(
           activePoint.x,
           activePoint.y,
           profile.seed + activePoint.x * 137.3 + activePoint.y * 271.9,
-          max(0.012, Float(frameDuration) * 0.82)
+          Float(frameDuration) * 0.82
         )
       )
     }
-    guard encodeWetFieldUpdates(wetDeposits, on: commandBuffer) else { return }
+    guard encodeWetFieldUpdates(wetDeposits, on: commandBuffer) else {
+      finishPresentation(id: presentationID, error: BurnRendererError.presentation("wet encoder"))
+      return
+    }
 
     let burnElapsed: TimeInterval
     if case .soakAndBurn = style {
@@ -373,7 +475,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       wetVisualProfile.dropletDensity,
       wetVisualProfile.verticalSag,
       wetVisualProfile.urineTintStrength,
-      0
+      WetMaterialOptics.refractiveIndex
     )
     var waterGeometry = SIMD4<Float>(
       wetVisualProfile.impactRadius,
@@ -393,6 +495,12 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       hasCapturedWindowShadow ? 1 : 0,
       shadowSamplingOffset.x,
       shadowSamplingOffset.y
+    )
+    var renderingInfo = SIMD4<Float>(
+      startTime != nil || previewElapsedTime != nil ? 1 : 0,
+      handoffTexture == nil ? 0 : 1,
+      isHandoffPrepared ? 1 : 0,
+      0
     )
     var wetUniforms =
       activeWetPoint.map { point in
@@ -422,8 +530,14 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         ignitionUniforms: ignitionUniforms,
         on: commandBuffer
       )
-    else { return }
+    else {
+      finishPresentation(
+        id: presentationID, error: BurnRendererError.presentation("combustion encoder"))
+      return
+    }
     guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPass) else {
+      finishPresentation(
+        id: presentationID, error: BurnRendererError.presentation("render encoder"))
       return
     }
 
@@ -446,6 +560,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       index: 3
     )
     encoder.setFragmentTexture(shadowTexture, index: 4)
+    encoder.setFragmentTexture(handoffTexture ?? texture, index: 5)
     encoder.setFragmentSamplerState(sampler, index: 0)
     encoder.setFragmentBytes(&timing, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
     encoder.setFragmentBytes(&padding, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
@@ -501,8 +616,34 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
       length: MemoryLayout<SIMD4<Float>>.stride,
       index: 15
     )
+    encoder.setFragmentBytes(
+      &renderingInfo,
+      length: MemoryLayout<SIMD4<Float>>.stride,
+      index: 16
+    )
     encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
     encoder.endEncoding()
+    let pendingPresentationID = presentationID
+    if let pendingPresentationID {
+      drawable.addPresentedHandler { [weak self] _ in
+        Task { @MainActor in
+          self?.finishPresentation(id: pendingPresentationID)
+        }
+      }
+    }
+    commandBuffer.addCompletedHandler { [weak self] buffer in
+      let duration = max(0, buffer.gpuEndTime - buffer.gpuStartTime)
+      let failure = buffer.status == .error ? buffer.error?.localizedDescription : nil
+      Task { @MainActor in
+        self?.lastGPUFrameDuration = duration
+        if let failure {
+          self?.finishPresentation(
+            id: pendingPresentationID,
+            error: BurnRendererError.presentation(failure)
+          )
+        }
+      }
+    }
     commandBuffer.present(drawable)
     commandBuffer.commit()
     if shouldSynchronizeNextFrame {
@@ -724,7 +865,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
     descriptor.colorAttachments[0].isBlendingEnabled = true
     descriptor.colorAttachments[0].rgbBlendOperation = .add
     descriptor.colorAttachments[0].alphaBlendOperation = .add
-    descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+    descriptor.colorAttachments[0].sourceRGBBlendFactor = .one
     descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
     descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
     descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
@@ -804,6 +945,13 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             amplitude *= 0.5;
         }
         return value;
+    }
+
+    float paperGrain(float2 physicalUV, float seed) {
+        float2 offset = float2(seed * 0.0137, seed * 0.0319);
+        float bundles = valueNoise(physicalUV * float2(48.0, 240.0) + offset);
+        float fibers = valueNoise(physicalUV * float2(153.0, 610.0) + offset * 3.1);
+        return bundles * 0.68 + fibers * 0.32;
     }
 
     float radialEdgeOffset(
@@ -895,9 +1043,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 radius,
                 distance
             );
-            contribution *= 0.78 + valueNoise(
-                uv * float2(83.0, 49.0) + wetPoint.z * 0.011
-            ) * 0.22;
+            contribution *= 0.70 + paperGrain(uv * float2(aspect, 1.0), fieldInfo.w) * 0.30;
             density += contribution * max(0.0, wetPoint.w);
         }
 
@@ -1031,10 +1177,15 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             moisture = max(moisture, depositedMoisture);
         }
 
-        float retainedHeat = heat * max(0.0, 1.0 - heatDecay * deltaTime);
-        float spreadHeat = clamp(neighborHeat, 0.0, maximumHeat) * spreadRate;
+        if (deltaTime <= 0.0) {
+            nextState.write(float4(heat, moisture, fuel, damage), position);
+            return;
+        }
+        float retainedHeat = heat * exp(-heatDecay * deltaTime);
+        float heatDifference = max(0.0, clamp(neighborHeat, 0.0, maximumHeat) - heat);
+        float spreadHeat = heatDifference * (1.0 - exp(-spreadRate * 8.0 * deltaTime));
         float nextHeat = min(
-            max(max(retainedHeat, spreadHeat), max(sourceHeat, 0.0)),
+            max(retainedHeat + spreadHeat, max(sourceHeat, 0.0)),
             maximumHeat
         );
         float evaporatedMoisture = min(
@@ -1068,6 +1219,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         texture2d<float> backdrop [[texture(2)]],
         texture2d<float> combustionState [[texture(3)]],
         texture2d<float> windowShadow [[texture(4)]],
+        texture2d<float> handoffImage [[texture(5)]],
         sampler imageSampler [[sampler(0)]],
         constant float2 &timing [[buffer(0)]],
         constant float2 &padding [[buffer(1)]],
@@ -1084,7 +1236,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         constant float4 &waterGeometry [[buffer(12)]],
         constant float4 &wetPaperDamage [[buffer(13)]],
         constant float &windowCornerRadius [[buffer(14)]],
-        constant float4 &replacementInfo [[buffer(15)]]
+        constant float4 &replacementInfo [[buffer(15)]],
+        constant float4 &renderingInfo [[buffer(16)]]
     ) {
         float progress = timing.x;
         float time = timing.y;
@@ -1124,13 +1277,24 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         float2 contentSize = 1.0 - padding * 2.0;
         float2 imageUV = (input.uv - padding) / contentSize;
 
+        // A presented, unmodified compositor cover bridges the native window handoff.
+        // Both this cover and all material textures have an explicit premultiplied layout.
+        if (replacementInfo.x < 0.5 && renderingInfo.y > 0.5
+            && (renderingInfo.x < 0.5 || renderingInfo.z > 0.5)) {
+            return handoffImage.sample(imageSampler, input.uv);
+        }
+        if (renderingInfo.x < 0.5) {
+            float4 original = image.sample(imageSampler, imageUV);
+            float4 shadow = windowShadow.sample(imageSampler, input.uv + replacementInfo.zw);
+            return replacementInfo.x * replacementInfo.y > 0.5 ? shadow : original;
+        }
+
         float horizontalMask = step(0.0, imageUV.x) * step(imageUV.x, 1.0);
         float rectangleMask = horizontalMask
             * step(0.0, imageUV.y)
             * step(imageUV.y, 1.0);
         float capturedShape = image.sample(imageSampler, imageUV).a;
-        float insideMask = rectangleMask
-            * smoothstep(0.01, 0.99, capturedShape);
+        float insideMask = rectangleMask * capturedShape;
         float contentAspect = aspect * contentSize.x / max(contentSize.y, 0.001);
         float2 shapePosition = (imageUV - 0.5) * float2(contentAspect, 1.0);
         float2 shapeHalfSize = float2(contentAspect * 0.5, 0.5);
@@ -1167,12 +1331,12 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
 
         if (radialMode > 0.5 && ignitionCount > 0) {
             float nearestFront = 1000.0;
-            float maximumRadius = length(float2(aspect, 1.0)) + 0.12;
+            float maximumRadius = length(float2(contentAspect, 1.0)) + 0.12;
             for (uint index = 0; index < ignitionCount; index++) {
                 float4 ignition = ignitions[index];
                 float age = max(0.0, time - ignition.z);
                 float ignitionProgress = clamp(age / burnDuration, 0.0, 1.0);
-                float2 delta = (imageUV - ignition.xy) * float2(aspect, 1.0);
+                float2 delta = (imageUV - ignition.xy) * float2(contentAspect, 1.0);
                 float radialDistance = length(delta);
                 float radialRagged = radialEdgeOffset(
                     imageUV,
@@ -1191,14 +1355,13 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             signedDistance = 1000.0;
         }
 
-        float grain = fbm(imageUV * float2(31.0, 19.0) + seedOffset * 3.7);
+        float grain = paperGrain(imageUV * float2(contentAspect, 1.0), seed);
         float pinholeNoise = valueNoise(imageUV * float2(83.0, 47.0) + seedOffset * 8.1);
         float scorchBand = insideMask
             * step(0.0, signedDistance)
             * (1.0 - smoothstep(0.0, charWidth * 1.35, signedDistance));
         scorchBand *= 0.58 + grain * 0.42;
-        float stateScorch = smoothstep(0.06, 0.34, combustionDamage)
-            * (1.0 - smoothstep(0.72, 0.98, combustionDamage));
+        float stateScorch = smoothstep(0.01, 0.12, combustionDamage);
         scorchBand *= mix(1.0, stateScorch, soakMode);
         float pores = scorchBand
             * smoothstep(0.74, 0.95, pinholeNoise + scorchBand * 0.18);
@@ -1350,7 +1513,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 wrinkleFullDensity,
                 bakedDensity
             );
-            float2 paperCoordinate = imageUV * float2(aspect, 1.0);
+            float2 paperCoordinate = imageUV * float2(contentAspect, 1.0);
             float foldWarp = fbm(
                 imageUV * float2(10.0, 8.0) + seedOffset * 4.3
             ) * 6.0;
@@ -1452,7 +1615,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                     imageUV * float2(83.0, 49.0)
                     + float2(wetPoint.z * 0.031, wetPoint.z * 0.011)
                 );
-                float2 filmDelta = wetDelta * float2(aspect, 1.0);
+                float2 filmDelta = wetDelta * float2(contentAspect, 1.0);
                 float filmDistance = length(filmDelta);
                 float filmAngle = atan2(filmDelta.y, filmDelta.x);
                 float localRadius = mix(
@@ -1509,7 +1672,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 liquidFilm *= mix(0.62, 1.0, stillSoaking);
 
                 float impactDistance = length(
-                    wetDelta * float2(aspect, 1.0)
+                    wetDelta * float2(contentAspect, 1.0)
                 );
                 float impactPulse = 0.91 + sin(time * 22.0) * 0.09;
                 float impactBody = (
@@ -1612,14 +1775,14 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 activeImpactRim * 0.64
             );
 
-            float2 dropletGrid = float2(34.0 * aspect, 26.0);
+            float2 dropletGrid = float2(34.0 * contentAspect, 26.0);
             float2 dropletCell = floor(imageUV * dropletGrid);
             float dropSeed = hash21(dropletCell + seedOffset * 13.0);
             float dropSeedY = hash21(dropletCell.yx + seedOffset * 21.0 + 7.3);
             float2 dropletCenter = (
                 dropletCell + float2(dropSeed, dropSeedY)
             ) / dropletGrid;
-            dropletDelta = (imageUV - dropletCenter) * float2(aspect, 1.0);
+            dropletDelta = (imageUV - dropletCenter) * float2(contentAspect, 1.0);
             dropletRadius = mix(0.0032, 0.0086, hash21(dropletCell + 41.7));
             float dropletDistance = length(dropletDelta);
             float dropletBody = 1.0 - smoothstep(
@@ -1708,12 +1871,19 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         pores *= combustibleMask;
         keep *= 1.0 - pores * 0.82;
 
-        float4 source = image.sample(imageSampler, clamp(sourceUV, 0.0, 1.0));
+        float curlBand = (1.0 - smoothstep(0.0, hotCoreWidth * 7.0, abs(signedDistance)))
+            * smoothstep(0.06, 0.32, combustionDamage) * insideMask * combustibleMask;
+        float2 burnNormal = normalize(float2(dfdx(signedDistance), dfdy(signedDistance))
+            + float2(0.00001));
+        sourceUV += burnNormal * curlBand * float2(0.0018 / contentAspect, 0.0018);
+
+        float4 source = image.sample(imageSampler, sourceUV);
+        source.rgb = source.a > 0.0001 ? source.rgb / source.a : float3(0.0);
         if (absorptionMask > 0.001) {
             float densityBlur = log2(1.0 + max(0.0, localFluidDensity));
             float blurScale = 0.82 + densityBlur * 0.34;
             float2 blurStep = float2(
-                backgroundBlurRadius / max(aspect, 0.001),
+                backgroundBlurRadius / max(contentAspect, 0.001),
                 backgroundBlurRadius
             ) * blurScale;
             float3 blurredSource = source.rgb * 4.0;
@@ -1782,123 +1952,43 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                 * (0.07 + min(densityBlur * 0.018, 0.09));
         }
         if (wetMask > 0.001) {
-            float2 dispersionOffset = waterNormalXY
-                * dispersionStrength
-                * wetMask;
-            float red = image.sample(
-                imageSampler,
-                clamp(sourceUV + dispersionOffset, 0.0, 1.0)
-            ).r;
-            float blue = image.sample(
-                imageSampler,
-                clamp(sourceUV - dispersionOffset, 0.0, 1.0)
-            ).b;
-            source.rgb = float3(red, source.g, blue);
+            // Absorbed liquid changes transmission; a free surface contributes reflection.
+            // Beer-Lambert extinction does not turn black printed pixels yellow.
+            float opticalDepth = max(0.0, waterThickness * 1.8 + absorptionMask * 0.38)
+                * urineTintStrength;
+            float3 transmittance = exp(-float3(0.11, 0.26, 1.15) * opticalDepth);
+            float3 linearSource = pow(max(source.rgb, 0.0), float3(2.2));
+            linearSource *= transmittance;
+            float fiberDarkening = absorptionMask * (0.035 + grain * 0.075);
+            linearSource *= 1.0 - fiberDarkening;
 
-            float3 waterNormal = normalize(float3(
-                -waterNormalXY.x * 2.7,
-                -waterNormalXY.y * 2.7,
-                1.0
-            ));
-            float3 lightDirection = normalize(float3(-0.42, -0.58, 0.70));
+            float3 waterNormal = normalize(float3(-waterNormalXY * 1.65, 1.0));
+            float3 lightDirection = normalize(float3(-0.46, -0.62, 0.64));
             float3 halfVector = normalize(lightDirection + float3(0.0, 0.0, 1.0));
-            float specular = pow(max(dot(waterNormal, halfVector), 0.0), 30.0);
-            float reflectionBand = smoothstep(
-                0.78,
-                0.99,
-                sin(
-                    imageUV.y * 31.0
-                    - imageUV.x * 7.0
-                    + seedOffset.x
-                ) * 0.5 + 0.5
-            );
-            float2 reflectionUV = clamp(
-                sourceUV + float2(
-                    waterNormalXY.x * 0.034,
-                    -0.055 - waterNormalXY.y * 0.026
-                ),
-                0.0,
-                1.0
-            );
-            float3 reflected = image.sample(imageSampler, reflectionUV).rgb;
-            float fresnel = 0.08 + pow(1.0 - max(waterNormal.z, 0.0), 2.2);
+            float normalReflectance = pow((1.0 - waterDetail.w) / (1.0 + waterDetail.w), 2.0);
+            float fresnel = normalReflectance
+                + (1.0 - normalReflectance) * pow(1.0 - max(waterNormal.z, 0.0), 5.0);
+            float freeSurface = max(liquidMask * 0.55, dropletMask);
+            float3 reflectedDirection = reflect(float3(0.0, 0.0, -1.0), waterNormal);
+            // A broad studio/sky lobe is a stable environment approximation, not moving stripes.
+            float sky = smoothstep(-0.25, 0.75, reflectedDirection.y);
+            float3 environment = mix(float3(0.10, 0.12, 0.15), float3(0.76, 0.84, 0.95), sky);
+            float specularAlignment = max(dot(waterNormal, halfVector), 0.0);
+            float specular = pow(specularAlignment, 120.0)
+                + pow(specularAlignment, 14.0) * 0.08;
             float reflectionAmount = clamp(
-                wetMask * reflectionStrength * (0.20 + fresnel * 1.25)
-                    + dropletRim * 0.035,
+                freeSurface * fresnel + wetRim * reflectionStrength * 0.25,
                 0.0,
-                0.22
+                0.8
             );
-            float3 reflectionTint = mix(
-                reflected,
-                float3(0.66, 0.80, 0.94),
-                0.10
-            );
-            source.rgb = mix(source.rgb, reflectionTint, reflectionAmount);
-
-            float3 urineTint = float3(0.93, 0.72, 0.19);
-            float3 absorbedEdgeTint = float3(0.57, 0.34, 0.055);
-            float visibleAbsorption = smoothstep(
-                0.015,
-                0.34,
-                absorptionMask
-            );
-            float visibleLiquid = smoothstep(
-                0.015,
-                0.24,
-                liquidMask
-            );
-            float tintAmount = clamp(
-                (
-                    visibleAbsorption * 0.24
-                    + visibleLiquid * 0.10
-                ) * urineTintStrength,
-                0.0,
-                0.30
-            );
-            source.rgb = mix(source.rgb, urineTint, tintAmount);
-            source.rgb.b *= 1.0 - tintAmount * 0.18;
-            float sourceLuminance = dot(
-                source.rgb,
-                float3(0.2126, 0.7152, 0.0722)
-            );
-            float darkSurfaceBoost = mix(
-                0.055,
-                0.018,
-                smoothstep(0.14, 0.72, sourceLuminance)
-            );
-            source.rgb += urineTint
-                * visibleLiquid
-                * urineTintStrength
-                * darkSurfaceBoost;
-            source.rgb += urineTint
-                * visibleAbsorption
-                * urineTintStrength
-                * 0.042;
-            float absorbedEdge = smoothstep(0.05, 0.34, absorptionMask)
-                * (1.0 - smoothstep(0.58, 0.94, absorptionMask));
-            source.rgb = mix(
-                source.rgb,
-                absorbedEdgeTint,
-                absorbedEdge * urineTintStrength * 0.22
-            );
-            source.rgb += urineTint * wetRim * 0.035;
-
-            float highlight = specular * wetMask * (0.055 + waterThickness * 0.08);
-            highlight += wetRim * (0.012 + reflectionBand * 0.025);
-            highlight += dropletHighlight * 0.07 + dropletRim * 0.012;
-            source.rgb += float3(1.0, 0.88, 0.42)
-                * highlight
+            linearSource = linearSource * (1.0 - reflectionAmount)
+                + environment * reflectionAmount;
+            linearSource += float3(0.98, 0.99, 1.0)
+                * (specular * freeSurface * 0.10
+                    + dropletHighlight * 0.16
+                    + wetRim * 0.008)
                 * highlightIntensity;
-            source.rgb *= 1.0 - wetMask * 0.02;
-            float4 softReflection = image.sample(
-                imageSampler,
-                clamp(reflectionUV + waterNormalXY * 0.006, 0.0, 1.0)
-            );
-            source.rgb = mix(
-                source.rgb,
-                softReflection.rgb,
-                waterThickness * wetMask * 0.008
-            );
+            source.rgb = pow(max(linearSource, 0.0), float3(1.0 / 2.2));
         }
         if (wrinkleMask > 0.001) {
             source.rgb *= 1.0 + paperFoldLighting * 0.22;
@@ -1928,7 +2018,8 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             * residualCharOpacity
             * combustibleMask
             * (0.42 + grain * 0.58);
-        source.a *= insideMask * max(keep, burnedResidue);
+        // Preserve source coverage once; squaring captured alpha darkens rounded borders.
+        source.a = capturedShape * rectangleMask * max(keep, burnedResidue);
 
         float localEffectCoverage = max(
             max(absorptionMask, liquidMask),
@@ -1943,14 +2034,18 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             * (1.0 - step(1.5, wetInfo.y));
         source.a *= mix(1.0, localOverlayCoverage, preserveNativeWindow);
 
-        float3 toastedSource = source.rgb * float3(0.50, 0.16, 0.035);
+        float3 toastedSource = source.rgb * float3(0.46, 0.23, 0.08);
         float3 edgeSoot = mix(
-            float3(0.16, 0.025, 0.004),
-            float3(0.018, 0.006, 0.002),
+            float3(0.080, 0.053, 0.032),
+            float3(0.014, 0.012, 0.010),
             grain
         );
         source.rgb = mix(source.rgb, toastedSource, scorchBand * 0.46);
-        source.rgb = mix(source.rgb, edgeSoot, scorchBand * scorchBand * 0.64);
+        source.rgb = mix(source.rgb, edgeSoot, scorchBand * scorchBand * 0.86);
+        source.rgb *= 1.0 + curlBand * dot(burnNormal, float2(-0.45, -0.65)) * 0.30;
+        float ashFibers = smoothstep(0.68, 0.88, grain)
+            * scorchBand * smoothstep(0.45, 0.82, combustionDamage);
+        source.rgb = mix(source.rgb, float3(0.31, 0.29, 0.26), ashFibers * 0.4);
 
         float effectMask = mix(horizontalMask, insideMask, radialMode)
             * combustibleMask
@@ -1981,53 +2076,58 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         hotCore = max(hotCore, tornEdgeArrival * edgeFlicker * 0.82);
         emberEdge = max(emberEdge, tornEdgeArrival * 0.74);
         glow = max(glow, tornEdgeArrival * 0.52);
+        float emberPatches = smoothstep(0.30, 0.74, grain * 0.72 + edgeFlicker * 0.28);
+        hotCore *= emberPatches * 0.28;
+        emberEdge *= 0.45 + emberPatches * 0.25;
+        glow *= 0.35;
 
-        float flameMotion = fbm(float2(
-            imageUV.x * (8.0 + turbulence * 2.8) + time * 0.42 + seedOffset.x,
-            imageUV.y * 2.7 - time * 2.9 + seedOffset.y
-        ));
-        float flameDetail = fbm(
-            imageUV * float2(31.0, 12.0)
-            + float2(seedOffset.y - time * 0.75, seedOffset.x - time * 4.1)
-        );
-        float broadLicks = valueNoise(float2(
-            imageUV.x * 13.0 - time * 0.38 + seedOffset.y,
-            time * 0.72 + seedOffset.x
-        ));
-        float fineLicks = valueNoise(float2(
-            imageUV.x * 39.0 + time * 0.21 + seedOffset.x,
-            time * 1.27 + seedOffset.y
-        ));
-        float lickHeight = pow(
-            clamp(broadLicks * 0.72 + fineLicks * 0.38, 0.0, 1.0),
-            1.65
-        );
-        float flameReach = maximumFlameReach
-            * (0.16 + lickHeight * 0.84)
-            * (0.82 + flameMotion * 0.31);
-        float flameEnvelope = effectMask
-            * step(signedDistance, 0.0)
-            * (1.0 - smoothstep(hotCoreWidth * 0.65, flameReach, burnedDistance));
-        float flameBreakup = smoothstep(
-            0.25,
-            0.73,
-            flameDetail + flameMotion * 0.28
-        );
-        float breakupMix = smoothstep(emberWidth, flameReach, burnedDistance);
-        float flame = flameEnvelope
-            * mix(1.0, 0.44 + flameBreakup * 0.56, breakupMix);
-        float flamePhase = clamp(burnedDistance / max(flameReach, 0.001), 0.0, 1.0);
-
-        float3 deepRed = float3(0.72, 0.006, 0.001);
-        float3 orange = float3(1.0, 0.16, 0.002);
-        float3 gold = float3(1.0, 0.68, 0.055);
-        float3 hotWhite = float3(1.0, 0.96, 0.72);
-        float3 flameColor = mix(deepRed, orange, 1.0 - flamePhase);
-        flameColor = mix(
-            flameColor,
-            gold,
-            pow(1.0 - flamePhase, 2.4)
-        );
+        // Integrate a short buoyant column above the actual reacting material. Each
+        // sample follows a rising, curling streamline back down to its fuel source.
+        // This is a 2.5D participating-medium approximation, not a 3D fluid solver.
+        float2 gasCoordinate = imageUV * float2(contentAspect, 1.0);
+        float curl = fbm(gasCoordinate * float2(8.0, 5.0)
+            + float2(seedOffset.x, time * 1.4)) - 0.5;
+        float opticalDepth = 0.0;
+        float hotGas = 0.0;
+        for (uint layer = 0; layer < 8; layer++) {
+            float heightFraction = pow((float(layer) + 0.35) / 8.0, 1.5);
+            float rise = maximumFlameReach * heightFraction;
+            float2 foot = imageUV + float2(
+                (curl * rise * 0.46
+                    + sin(time * 3.1 + imageUV.y * 19.0 + heightFraction * 4.0)
+                        * rise * 0.12) / contentAspect,
+                rise
+            );
+            float footInside = step(0.0, foot.x) * step(foot.x, 1.0)
+                * step(0.0, foot.y) * step(foot.y, 1.0);
+            float4 fuelState = combustionState.sample(imageSampler, clamp(foot, 0.0, 1.0));
+            float fuelShape = image.sample(imageSampler, foot).a * footInside;
+            float reaction = smoothstep(0.23, 0.78, fuelState.r)
+                * smoothstep(0.015, 0.14, fuelState.a)
+                * smoothstep(0.01, 0.40, fuelState.b)
+                * (1.0 - smoothstep(0.08, 0.72, fuelState.g))
+                * fuelShape;
+            float gasNoise = fbm(float2(
+                gasCoordinate.x * 31.0 + curl * heightFraction * 2.2 + seedOffset.y,
+                imageUV.y * 19.0 + time * 4.8 + float(layer) * 3.713
+            ));
+            float tongue = smoothstep(0.20 + heightFraction * 0.27, 0.76, gasNoise);
+            float entrainment = pow(1.0 - heightFraction, 1.5);
+            float density = reaction * tongue * entrainment * 0.42;
+            opticalDepth += density;
+            hotGas += density * clamp(fuelState.r / 1.5, 0.0, 1.0)
+                * (1.0 - heightFraction * 0.62);
+        }
+        float flame = 1.0 - exp(-opticalDepth * 3.4);
+        float gasTemperature = opticalDepth > 0.0001 ? hotGas / opticalDepth : 0.0;
+        // Incandescent soot cools from pale yellow at its reaction zone to red at the tips.
+        float3 deepRed = float3(0.74, 0.025, 0.002);
+        float3 orange = float3(1.0, 0.25, 0.015);
+        float3 gold = float3(1.0, 0.73, 0.22);
+        float3 hotWhite = float3(1.0, 0.94, 0.72);
+        float3 flameColor = mix(deepRed, orange, smoothstep(0.10, 0.38, gasTemperature));
+        flameColor = mix(flameColor, gold, smoothstep(0.38, 0.78, gasTemperature));
+        flameColor = mix(flameColor, hotWhite, smoothstep(0.72, 1.0, gasTemperature) * 0.65);
 
         float sparkCell = floor(imageUV.x * 92.0);
         float sparkSeed = hash21(float2(sparkCell + seedOffset.x, 9.7 + seedOffset.y));
@@ -2040,7 +2140,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
         sparkX += (sparkDrift - 0.5) * sparkTravel * 0.12;
         float sparkY = front - 0.018 - sparkTravel;
         float2 sparkDelta = float2(
-            (imageUV.x - sparkX) * aspect,
+            (imageUV.x - sparkX) * contentAspect,
             imageUV.y - sparkY
         );
         float sparkHead = 1.0 - smoothstep(0.0012, 0.0065, length(sparkDelta));
@@ -2057,7 +2157,7 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             * sparkFlicker;
 
         if (radialMode > 0.5 && ignitionCount > 0) {
-            float maximumRadius = length(float2(aspect, 1.0)) + 0.12;
+            float maximumRadius = length(float2(contentAspect, 1.0)) + 0.12;
             for (uint index = 0; index < ignitionCount; index++) {
                 float4 ignition = ignitions[index];
                 float age = max(0.0, time - ignition.z);
@@ -2078,13 +2178,13 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
                     );
                     float angle = particleSeed * 6.2831853;
                     float2 particlePosition = ignition.xy + float2(
-                        cos(angle) / aspect,
+                        cos(angle) / contentAspect,
                         sin(angle)
                     ) * max(0.0, radius - emberWidth * 0.45);
                     particlePosition.x += (driftSeed - 0.5) * particleAge * 0.12;
                     particlePosition.y -= particleAge * (0.22 + particleSeed * 0.34);
                     float2 particleDelta = float2(
-                        (imageUV.x - particlePosition.x) * aspect,
+                        (imageUV.x - particlePosition.x) * contentAspect,
                         imageUV.y - particlePosition.y
                     );
                     float particleHead = 1.0 - smoothstep(
@@ -2116,11 +2216,11 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             * (1.0 - smoothstep(glowWidth, maximumFlameReach * 2.15, burnedDistance))
             * (0.045 + 0.10 * fbm(float2(
                 imageUV.x * 5.0 + time * 0.25 + seedOffset.x,
-                imageUV.y * 4.0 - time * 0.34 + seedOffset.y
+                imageUV.y * 4.0 + time * 0.34 + seedOffset.y
             )));
         float steamNoise = fbm(float2(
             imageUV.x * 7.0 + time * 0.18 + seedOffset.y,
-            imageUV.y * 6.0 - time * 0.72 + seedOffset.x
+            imageUV.y * 6.0 + time * 0.72 + seedOffset.x
         ));
         float steam = insideMask
             * soakMode
@@ -2136,56 +2236,27 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
             + orange * emberEdge * 1.05
             + flameColor * flame * 1.58
             + hotWhite * hotCore * 1.95;
-        float outsideDistance = max(0.0, roundedRectangleDistance);
-        float shapeAntialias = max(fwidth(roundedRectangleDistance), 0.0005);
-        float exterior = 1.0 - insideMask;
-        float replacementActive = replacementInfo.x;
-        float hasNativeShadow = replacementInfo.y;
-        float survivingExterior = smoothstep(0.08, 0.72, keep);
-        float4 capturedShadow = windowShadow.sample(
-            imageSampler,
-            input.uv + replacementInfo.zw
-        );
-        float nativeShadowAlpha = capturedShadow.a
-            * exterior
-            * survivingExterior
-            * replacementActive
-            * hasNativeShadow;
-        float fallbackExterior = smoothstep(
-            -shapeAntialias,
-            shapeAntialias,
-            roundedRectangleDistance
-        );
-        float exteriorShadow = exterior
-            * (1.0 - smoothstep(0.006, 0.065, outsideDistance))
-            * survivingExterior
-            * replacementActive
-            * (1.0 - hasNativeShadow)
-            * 0.30;
-        float exteriorRim = fallbackExterior
-            * (1.0 - smoothstep(0.0, 0.0045, outsideDistance))
-            * survivingExterior
-            * replacementActive
-            * (1.0 - hasNativeShadow)
-            * 0.18;
-        float exteriorDepth = max(
-            nativeShadowAlpha,
-            max(exteriorShadow, exteriorRim)
-        );
-        float outputAlpha = max(
-            source.a,
-            max(exteriorDepth, max(fireAlpha, max(spark, max(smoke, steam))))
-        );
-        float3 outputRGB = source.rgb * source.a
-            + fireRGB
-            + float3(1.0, 0.48, 0.045) * spark * 2.20
-            + float3(0.10, 0.075, 0.068) * smoke
-            + float3(0.80, 0.88, 0.92) * steam * 1.18
-            + capturedShadow.rgb * nativeShadowAlpha
-            + float3(0.012, 0.010, 0.009) * exteriorShadow
-            + float3(0.20, 0.17, 0.13) * exteriorRim;
+        // The padded capture also contains the body: only use it outside that crop.
+        // Corners already belong to the original body and must not receive alpha twice.
+        float exterior = 1.0 - rectangleMask;
+        float shadowVisibility = exterior * smoothstep(0.08, 0.72, keep)
+            * replacementInfo.x * replacementInfo.y;
+        float4 capturedShadow = windowShadow.sample(imageSampler, input.uv + replacementInfo.zw);
+        float4 surface = float4(source.rgb * source.a, source.a);
+        surface += capturedShadow * shadowVisibility * (1.0 - surface.a);
 
-        outputRGB = outputAlpha > 0.0 ? outputRGB / outputAlpha : 0.0;
+        float vaporAlpha = clamp(smoke + steam * 0.52, 0.0, 0.7);
+        float3 vaporColor = mix(float3(0.11, 0.10, 0.09), float3(0.78, 0.83, 0.86),
+            steam / max(smoke + steam, 0.001));
+        float3 outputRGB = vaporColor * vaporAlpha + surface.rgb * (1.0 - vaporAlpha);
+        float outputAlpha = vaporAlpha + surface.a * (1.0 - vaporAlpha);
+        fireAlpha = clamp(fireAlpha, 0.0, 0.96);
+        float3 radiance = 1.0 - exp(-fireRGB * 1.1);
+        outputRGB = radiance * fireAlpha + outputRGB * (1.0 - fireAlpha);
+        outputAlpha = fireAlpha + outputAlpha * (1.0 - fireAlpha);
+        float sparkAlpha = clamp(spark, 0.0, 1.0);
+        outputRGB = float3(1.0, 0.68, 0.22) * sparkAlpha + outputRGB * (1.0 - sparkAlpha);
+        outputAlpha = sparkAlpha + outputAlpha * (1.0 - sparkAlpha);
         return float4(outputRGB, outputAlpha);
     }
     """#

@@ -34,6 +34,10 @@ final class TorchCursorController {
   private var isTrackingPointerDrag = false
   private(set) var style: EffectCursorStyle?
   var isEnabled: Bool { style != nil }
+  var captureWindowIDs: Set<CGWindowID> {
+    guard let panel, panel.windowNumber > 0 else { return [] }
+    return [CGWindowID(panel.windowNumber)]
+  }
 
   func setEnabled(_ enabled: Bool) {
     setStyle(enabled ? .torch : nil)

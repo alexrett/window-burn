@@ -1,3 +1,5 @@
+import Foundation
+
 public struct CombustionProfile: Equatable, Sendable {
   public let ignitionThreshold: Float
   public let moistureResistance: Float
@@ -67,11 +69,15 @@ public enum CombustionModel {
     let moisture = min(max(state.moisture, 0), 1)
     let fuel = min(max(state.fuel, 0), 1)
     let damage = min(max(state.damage, 0), 1)
+    guard deltaTime > 0 else {
+      return CombustionCellState(heat: heat, moisture: moisture, fuel: fuel, damage: damage)
+    }
 
-    let retainedHeat = heat * max(0, 1 - profile.heatDecay * deltaTime)
-    let spreadHeat = min(max(neighboringHeat, 0), profile.maximumHeat) * profile.spreadRate
+    let retainedHeat = heat * exp(-profile.heatDecay * deltaTime)
+    let heatDifference = max(0, min(max(neighboringHeat, 0), profile.maximumHeat) - heat)
+    let spreadHeat = heatDifference * (1 - exp(-profile.spreadRate * 8 * deltaTime))
     var nextHeat = min(
-      max(max(retainedHeat, spreadHeat), max(sourceHeat, 0)),
+      max(retainedHeat + spreadHeat, max(sourceHeat, 0)),
       profile.maximumHeat
     )
 
@@ -161,9 +167,7 @@ public enum CombustionVisualModel {
         smoothstep(0.16, 0.76, remainingMoisture) * 0.75
       )
     let steamOpacity = min(0.62, boilingMoisture * 0.62)
-    let scorchOpacity =
-      smoothstep(0.06, 0.34, damage)
-      * (1 - smoothstep(0.72, 0.98, damage))
+    let scorchOpacity = smoothstep(0.01, 0.12, damage)
 
     let undamagedMaterial = 1 - smoothstep(0.50, 0.98, damage)
     let materialVisibility =
