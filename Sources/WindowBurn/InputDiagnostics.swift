@@ -5,7 +5,7 @@ import QuartzCore
 
 /// Opt-in timing and event counts. Never records window contents or pointer coordinates.
 enum InputDiagnostics {
-  private static let isEnabled = CommandLine.arguments.contains("--input-diagnostics")
+  static let isEnabled = CommandLine.arguments.contains("--input-diagnostics")
   private static let recorder = InputDiagnosticsRecorder()
   @MainActor private static var heartbeatTimer: Timer?
 
@@ -19,9 +19,16 @@ enum InputDiagnostics {
     recorder.start()
   }
 
-  static func eventTap(type: CGEventType, duration: TimeInterval) {
+  static func productionTap(_ tap: CFMachPort) {
     guard isEnabled else { return }
-    recorder.productionEvent(type: type, duration: duration)
+    recorder.productionTap(tap)
+  }
+
+  static func eventTap(
+    type: CGEventType, duration: TimeInterval, timestamp: CGEventTimestamp = 0
+  ) {
+    guard isEnabled else { return }
+    recorder.productionEvent(type: type, duration: duration, timestamp: timestamp)
   }
 
   static func cursorMoved(point: CGPoint) {
@@ -48,7 +55,8 @@ private final class InputDiagnosticsRecorder: @unchecked Sendable {
     var moved = 0
     var dragged = 0
     var up = 0
-    var disabled = 0
+    var disabledByTimeout = 0
+    var disabledByUserInput = 0
 
     mutating func add(_ type: CGEventType) {
       switch type {
@@ -56,13 +64,15 @@ private final class InputDiagnosticsRecorder: @unchecked Sendable {
       case .mouseMoved: moved += 1
       case .leftMouseDragged: dragged += 1
       case .leftMouseUp: up += 1
-      case .tapDisabledByTimeout, .tapDisabledByUserInput: disabled += 1
+      case .tapDisabledByTimeout: disabledByTimeout += 1
+      case .tapDisabledByUserInput: disabledByUserInput += 1
       default: break
       }
     }
 
     var description: String {
-      "down=\(down),move=\(moved),drag=\(dragged),up=\(up),disabled=\(disabled)"
+      "down=\(down),move=\(moved),drag=\(dragged),up=\(up),"
+        + "timeout=\(disabledByTimeout),userDisabled=\(disabledByUserInput)"
     }
   }
 
@@ -71,6 +81,8 @@ private final class InputDiagnosticsRecorder: @unchecked Sendable {
     var production = EventCounts()
     var maximumCallbackDuration: TimeInterval = 0
     var slowCallbacks = 0
+    var eventAgeSamples = 0
+    var maximumEventAge: TimeInterval = 0
     var cursorMoves = 0
     var cursorPositionChanges = 0
     var recoverySamples = 0
@@ -83,6 +95,7 @@ private final class InputDiagnosticsRecorder: @unchecked Sendable {
   private struct State {
     var started = false
     var observerAvailable = false
+    var productionTap: CFMachPort?
     var heartbeat: TimeInterval = 0
     var previousRecoveryPoint: CGPoint?
     var previousCursorPoint: CGPoint?
@@ -119,13 +132,31 @@ private final class InputDiagnosticsRecorder: @unchecked Sendable {
     lock.withLock { state.heartbeat = CACurrentMediaTime() }
   }
 
-  func productionEvent(type: CGEventType, duration: TimeInterval) {
+  func productionTap(_ tap: CFMachPort) {
+    lock.withLock { state.productionTap = tap }
+  }
+
+  func productionEvent(
+    type: CGEventType, duration: TimeInterval, timestamp: CGEventTimestamp
+  ) {
+    let eventAge: TimeInterval?
+    if timestamp != 0, type != .tapDisabledByTimeout, type != .tapDisabledByUserInput {
+      let uptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+      let elapsedNanoseconds = uptimeNanoseconds >= timestamp ? uptimeNanoseconds - timestamp : 0
+      eventAge = max(0, Double(elapsedNanoseconds) / 1_000_000_000 - duration)
+    } else {
+      eventAge = nil
+    }
     lock.withLock {
       state.interval.production.add(type)
       state.interval.maximumCallbackDuration = max(
         state.interval.maximumCallbackDuration, duration
       )
       if duration >= 0.016 { state.interval.slowCallbacks += 1 }
+      if let eventAge {
+        state.interval.eventAgeSamples += 1
+        state.interval.maximumEventAge = max(state.interval.maximumEventAge, eventAge)
+      }
     }
   }
 
@@ -193,6 +224,8 @@ private final class InputDiagnosticsRecorder: @unchecked Sendable {
 
   private func report() {
     let now = CACurrentMediaTime()
+    let productionTap = lock.withLock { state.productionTap }
+    let productionTapEnabled = productionTap.map { CGEvent.tapIsEnabled(tap: $0) }
     let hidPressed = CGEventSource.buttonState(.hidSystemState, button: .left)
     let sessionPressed = CGEventSource.buttonState(.combinedSessionState, button: .left)
     let hidPoint = CGEventSource(stateID: .hidSystemState).flatMap { CGEvent(source: $0)?.location }
@@ -215,8 +248,10 @@ private final class InputDiagnosticsRecorder: @unchecked Sendable {
     let message =
       "hidObserver=\(observerAvailable) raw[\(metrics.raw.description)] "
       + "tap[\(metrics.production.description)] "
+      + "tapEnabled=\(productionTapEnabled.map(String.init) ?? "unavailable") "
       + "callbackMaxMs=\(milliseconds(metrics.maximumCallbackDuration)) "
       + "callbacksOver16ms=\(metrics.slowCallbacks) "
+      + "eventAge[samples=\(metrics.eventAgeSamples),maxMs=\(milliseconds(metrics.maximumEventAge))] "
       + "cursor[calls=\(metrics.cursorMoves),changed=\(metrics.cursorPositionChanges)] "
       + "mainAgeMs=\(milliseconds(heartbeatAge)) "
       + "recovery[samples=\(metrics.recoverySamples),changed=\(metrics.recoveryPositionChanges),"

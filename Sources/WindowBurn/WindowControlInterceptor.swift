@@ -50,10 +50,14 @@ final class WindowControlInterceptor {
     self.torchHandler = torchHandler
     self.soakAndBurnHandler = soakAndBurnHandler
 
-    let eventMask =
+    var eventMask =
       (CGEventMask(1) << CGEventType.leftMouseDown.rawValue)
       | (CGEventMask(1) << CGEventType.leftMouseDragged.rawValue)
       | (CGEventMask(1) << CGEventType.leftMouseUp.rawValue)
+    // Observe possible session-level reclassification without suppressing mouseMoved.
+    if InputDiagnostics.isEnabled {
+      eventMask |= CGEventMask(1) << CGEventType.mouseMoved.rawValue
+    }
     guard
       let eventTap = CGEvent.tapCreate(
         tap: .cgSessionEventTap,
@@ -69,6 +73,7 @@ final class WindowControlInterceptor {
 
     let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
     self.eventTap = eventTap
+    InputDiagnostics.productionTap(eventTap)
     runLoopSource = source
     CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
     CGEvent.tapEnable(tap: eventTap, enable: true)
@@ -196,7 +201,8 @@ private func windowControlEventTapCallback(
   let startedAt = ProcessInfo.processInfo.systemUptime
   defer {
     InputDiagnostics.eventTap(
-      type: type, duration: ProcessInfo.processInfo.systemUptime - startedAt)
+      type: type, duration: ProcessInfo.processInfo.systemUptime - startedAt,
+      timestamp: event.timestamp)
   }
 
   let shouldSuppress = MainActor.assumeIsolated {
