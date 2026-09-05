@@ -233,16 +233,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           guard let self else { return false }
           switch event {
           case .down:
-            torchCursor.beginPointerDrag(atQuartzPoint: location)
+            break
           case .dragged:
             torchCursor.move(toQuartzPoint: location)
           case .up:
             torchCursor.endPointerDrag(atQuartzPoint: location)
           }
           if case .down = event {
-            return torchCursor.withoutOverlay {
+            let accepted = torchCursor.withoutOverlay {
               coordinator.interceptSoakAndBurn(event, at: location)
             }
+            if accepted { torchCursor.beginPointerDrag(atQuartzPoint: location) }
+            return accepted
           }
           return coordinator.interceptSoakAndBurn(event, at: location)
         }

@@ -2,6 +2,7 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 import OSLog
+import WindowBurnCore
 
 enum WindowControlInterceptorError: LocalizedError {
   case eventTapUnavailable
@@ -31,8 +32,14 @@ final class WindowControlInterceptor {
   private var runLoopSource: CFRunLoopSource?
   private var suppressNextLeftMouseUp = false
   private var isSuppressingSoakSequence = false
+  private var dragRecovery = PointerDragRecovery()
+  private var dragTimer: Timer?
   var isTorchModeEnabled = false
-  var isSoakAndBurnModeEnabled = false
+  var isSoakAndBurnModeEnabled = false {
+    didSet {
+      if !isSoakAndBurnModeEnabled { stopDragRecovery() }
+    }
+  }
 
   init(
     closeHandler: @escaping CloseHandler,
@@ -69,10 +76,45 @@ final class WindowControlInterceptor {
   }
 
   func stop() {
+    stopDragRecovery()
     guard let runLoopSource else { return }
     CFRunLoopRemoveSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
     self.runLoopSource = nil
     eventTap = nil
+  }
+
+  private func stopDragRecovery() {
+    dragTimer?.invalidate()
+    dragTimer = nil
+    dragRecovery.end()
+  }
+
+  private func startDragRecovery(at point: CGPoint) {
+    stopDragRecovery()
+    dragRecovery.begin(at: point)
+    let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.recoverPointerState() }
+    }
+    dragTimer = timer
+    RunLoop.main.add(timer, forMode: .common)
+  }
+
+  private func recoverPointerState() {
+    guard
+      let source = CGEventSource(stateID: .hidSystemState),
+      let location = CGEvent(source: source)?.location
+    else { return }
+    let pressed = CGEventSource.buttonState(.hidSystemState, button: .left)
+    switch dragRecovery.sample(at: location, isPressed: pressed) {
+    case .dragged:
+      _ = soakAndBurnHandler(.dragged, location)
+    case .up:
+      stopDragRecovery()
+      _ = soakAndBurnHandler(.up, location)
+      logger.notice("Recovered a soak pointer release from hardware state")
+    case nil:
+      break
+    }
   }
 
   fileprivate func shouldSuppress(type: CGEventType, location: CGPoint) -> Bool {
@@ -91,20 +133,32 @@ final class WindowControlInterceptor {
 
     if type == .leftMouseUp, isSuppressingSoakSequence {
       isSuppressingSoakSequence = false
-      _ = soakAndBurnHandler(.up, location)
+      if dragRecovery.isActive {
+        stopDragRecovery()
+        _ = soakAndBurnHandler(.up, location)
+      }
       logger.info("Finished an intercepted soak-and-burn pointer sequence")
       return true
     }
 
     if type == .leftMouseDragged, isSuppressingSoakSequence {
-      _ = soakAndBurnHandler(.dragged, location)
+      if dragRecovery.sample(at: location, isPressed: true) != nil {
+        _ = soakAndBurnHandler(.dragged, location)
+      }
       return true
+    }
+
+    if type == .leftMouseDown {
+      // A hardware-recovered release may never reach this tap.
+      isSuppressingSoakSequence = false
+      suppressNextLeftMouseUp = false
     }
 
     if type == .leftMouseDown, isSoakAndBurnModeEnabled,
       soakAndBurnHandler(.down, location)
     {
       isSuppressingSoakSequence = true
+      startDragRecovery(at: location)
       logger.info("Intercepted a soak-and-burn click")
       return true
     }
