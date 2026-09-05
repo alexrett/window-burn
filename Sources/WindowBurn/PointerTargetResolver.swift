@@ -30,6 +30,15 @@ final class PointerTargetResolver: Sendable {
 
   func stop() { timer.cancel() }
 
+  static func nativeInputCandidates(from candidates: [PointWindowCandidate])
+    -> [PointWindowCandidate]
+  {
+    // WindowServer lists visual surfaces, including click-through screen-recording
+    // and cursor overlays. Only normal application windows define native targets
+    // and occlusion; our effect panels have explicit interaction surfaces.
+    candidates.filter { $0.layer == 0 && $0.isOnScreen && $0.alpha > 0.01 }
+  }
+
   private static func resolve(diagnostics: PointerResolverDiagnostics) -> ResolvedPointerTargets {
     let startedAt = ProcessInfo.processInfo.systemUptime
     let deadline = startedAt + 0.2
@@ -39,12 +48,9 @@ final class PointerTargetResolver: Sendable {
     var targets: [UUID: ResolvedPointerTarget] = [:]
     var windowsByPID: [pid_t: [AccessibleWindow]] = [:]
     let candidates = WindowServerWindowService.onScreenWindows()
-    for candidate in candidates {
-      guard candidate.isOnScreen, candidate.alpha > 0.01 else { continue }
-      // Our effect/cursor panels are handled by their explicit interaction surfaces.
-      if candidate.ownerPID == ownPID, candidate.layer >= 1000 { continue }
+    for candidate in Self.nativeInputCandidates(from: candidates) {
       let blocked = PointerTargetSnapshot.Region(id: nil, frame: candidate.frame)
-      guard candidate.layer == 0, candidate.ownerPID != ownPID,
+      guard candidate.ownerPID != ownPID,
         ProcessInfo.processInfo.systemUptime < deadline
       else {
         windowRegions.append(blocked)

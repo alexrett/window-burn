@@ -21,7 +21,7 @@ synchronous main-thread dispatch. Apple documents that the callback executes on
 [the run loop hosting its source](https://developer.apple.com/documentation/coregraphics/cgevent/tapcreate(tap:place:options:eventsofinterest:callback:userinfo:)).
 
 - A resolver worker prepares front-to-back native window and close-button regions.
-  Unsupported/covered/expired regions pass ordinary input through. AX reads have
+  Unsupported/covered/expired native regions pass ordinary input through. AX reads have
   an explicit per-handle deadline, and each application's window list is read
   once per refresh. Where an event supplies a native window ID, a mismatch rejects
   a stale target. The snapshot freshness limit is 300 ms; this remains a bounded
@@ -59,14 +59,58 @@ A separate physical soak gesture at 18:32:52–18:32:57 was followed by ignition
 18:32:58. In the surrounding 18:32:51–18:32:59 interval the HID observer and
 production tap both received 262 drags, two downs and two releases, with no
 disabled intervals. Maximum callback: 0.14 ms; event age: 0.24 ms; drawable wait:
-0.37 ms. This is a short gesture; the requested 15–20 second fixture check and
-subjective confirmation of the 18+ artwork remain pending.
+0.37 ms. This initial trial was short and did not yet include subjective
+confirmation of the 18+ artwork.
 
 `swift format lint --strict --recursive Package.swift Sources Tests` passes,
 as do all 113 tests and the universal arm64/x86_64 release build. The signed local
 app was rebuilt and relaunched with input diagnostics. The measurements above
 were captured during implementation; subsequent cache guards and idle-artwork
-changes have automated regression coverage, with the final long gesture pending.
+changes had automated regression coverage but still needed final physical input
+verification. The follow-up below records the final-build regression and retest.
+
+### Follow-up: native entry blocked in every application
+
+The user subsequently reported that both tools passed clicks and drags through
+in Finder and other applications. Diagnostics on the actual physical events at
+19:15:18–19:15:22 showed `decision=no-target`, fresh snapshots (25–92 ms), and no
+native event window ID. This was a target-selection failure, before effect
+creation or window-identity validation.
+
+The live WindowServer list contained a full-screen `Screenshot` surface on layer
+24 and cursor surfaces on layer 2147483630. The new resolver had treated every
+nonzero layer as an opaque input blocker. WindowServer enumerates visual surfaces;
+these click-through overlays therefore hid native input targets in the cache.
+The cursor surface alone can cover the click point, even without screen recording.
+
+The resolver now uses only visible normal application windows (layer 0) for
+native targets and occlusion, matching the existing `WindowAtPointMatcher` rule.
+Unsupported normal windows still block targets behind them. Active effect surfaces
+continue to use their explicit interaction regions. The regression test uses the
+observed full-screen recording and cursor layers above a normal Finder window:
+it failed before the filter change and passes afterward, with coverage for the
+cursor alone as well as the recording overlay. Additional interceptor
+tests cover first native entry for both tools with unavailable and matching event
+window IDs, retaining the original target through drag and release after refresh.
+
+Window Burn's own status menu suspends new interception while tracking, so its
+items cannot act on a normal window or burning surface underneath. A gesture
+accepted before the menu opens keeps ownership of its remaining drag/release.
+The suspension and restoration paths also have interceptor regression coverage.
+
+Final signed build, physical retest at 19:25:46–19:26:08: the user confirmed
+"Оба режима работают" and "вот сейчас просто идеально". Soaking started on a
+native Finder window from its first down, followed by ignition. Torch then
+started on another native Finder window and accepted three additional ignition
+sites. All eight downs, 208 drags and eight releases reached the production tap,
+matching the independent HID observer; no timeouts or disabled intervals occurred.
+Maximum callback: 0.52 ms; event age: 0.99 ms; drawable acquisition: 1.16 ms.
+
+All 123 tests pass, including cursor-layer cases with and without the recording
+overlay. Strict Swift format lint, `git diff --check`, the universal arm64/x86_64
+release build and the signed-app verification pass. The running app's Mach-O UUID
+matches the tested debug build. Local evidence is saved under ignored
+`dist/input-diagnostics/native-layer-fix/`.
 
 Regression coverage includes the core queue plus the actual interceptor's routing
 state, with rapid clicks, delayed release, missed release, mode off/on, unknown
@@ -81,7 +125,10 @@ Run diagnostics with:
 ./script/build_and_run.sh --input-diagnostics --soak-and-burn
 ```
 
-The resolver reports aggregate timing/counts only. The existing input diagnostics
+The resolver reports aggregate timing/counts only. Down-event decisions are
+buffered on the tap and logged by the main drain only with `--input-diagnostics`;
+they include the rejection reason, native/prepared window IDs and snapshot age.
+They do not include window titles or contents. The existing input diagnostics
 report raw/production event counts, callback age, cursor changes and drawable
 waits. GPU duration and drawable acquisition wait are different measurements.
 The [existing compositing limitations](input-and-compositing-audit.md#почему-cmd-tab-оставляет-мокрые-островки)

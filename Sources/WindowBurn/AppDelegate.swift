@@ -5,7 +5,7 @@ import OSLog
 import WindowBurnCore
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let logger = Logger(subsystem: "dev.malikov.WindowBurn", category: "app")
   private let coordinator = BurnCoordinator()
   private var qualityReview: QualityReviewController?
@@ -42,7 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       return
     }
     installStatusItem()
-    // Compile before installing the main-run-loop event tap, which must answer promptly.
+    // Prewarm effects before enabling interception on the dedicated input thread.
     if let device = MTLCreateSystemDefaultDevice() {
       do {
         try BurnRenderer.prewarm(device: device)
@@ -110,6 +110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     item.button?.toolTip = "Window Burn — burn ⌃⌥⌘B, torch ⌃⌥⌘F, soak & burn ⌃⌥⌘U"
 
     let menu = NSMenu()
+    menu.delegate = self
     let burnItem = NSMenuItem(
       title: "Burn & Close Front Window",
       action: #selector(burnFrontWindow),
@@ -183,6 +184,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     item.menu = menu
     statusItem = item
+  }
+
+  func menuWillOpen(_ menu: NSMenu) {
+    windowControlInterceptor?.isMenuTracking = true
+  }
+
+  func menuDidClose(_ menu: NSMenu) {
+    windowControlInterceptor?.isMenuTracking = false
   }
 
   private func installHotKeys() {

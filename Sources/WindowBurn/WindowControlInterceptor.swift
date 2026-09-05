@@ -25,10 +25,12 @@ final class WindowControlInterceptor {
   private let torchHandler: TorchHandler
   private let soakAndBurnHandler: SoakAndBurnHandler
   private let input = PointerTapState()
+  private let logger = Logger(subsystem: "dev.malikov.WindowBurn", category: "input-diagnostics")
   private var resolver: PointerTargetResolver?
   private var drainTimer: Timer?
   private var acceptedSoakSequence: UInt64?
   var interactionState: (() -> (surfaces: [PointerTargetSnapshot.Region], canStart: Bool))?
+  var isMenuTracking = false { didSet { publishConfiguration() } }
   var isTorchModeEnabled = false { didSet { publishConfiguration() } }
   var isSoakAndBurnModeEnabled = false {
     didSet {
@@ -67,12 +69,18 @@ final class WindowControlInterceptor {
     let state = interactionState?()
     input.configure(
       mode: isSoakAndBurnModeEnabled ? .soak : (isTorchModeEnabled ? .torch : .close),
-      surfaces: state?.surfaces ?? [], canStart: state?.canStart ?? true
+      surfaces: state?.surfaces ?? [], canStart: state?.canStart ?? true,
+      isSuspended: isMenuTracking
     )
   }
 
   private func drain() {
     let batch = input.drain()
+    for diagnostic in batch.diagnostics {
+      logger.notice(
+        "Pointer down: mode=\(diagnostic.mode, privacy: .public) decision=\(diagnostic.reason, privacy: .public) eventWindow=\(diagnostic.eventWindowID) preparedWindow=\(diagnostic.preparedWindowID) snapshotAgeMs=\(diagnostic.snapshotAge * 1_000, format: .fixed(precision: 2))"
+      )
+    }
     for event in batch.events {
       switch event.kind {
       case .down:
@@ -107,6 +115,14 @@ final class WindowControlInterceptor {
   }
 }
 
+struct PointerDownDiagnostic: Sendable {
+  let mode: String
+  let reason: String
+  let eventWindowID: Int64
+  let preparedWindowID: CGWindowID
+  let snapshotAge: TimeInterval
+}
+
 enum PointerRoute: Sendable {
   case close(AccessibleWindowControl)
   case torch(AccessibleWindow?)
@@ -125,10 +141,12 @@ final class PointerTapState: @unchecked Sendable {
   }
   private var mode = Mode.close
   private var canStart = true
+  private var isSuspended = false
   private var surfaces: [PointerTargetSnapshot.Region] = []
   private var targets = ResolvedPointerTargets()
   private var buffer = PointerEventBuffer(capacity: 128)
   private var routes: [UUID: PointerRoute] = [:]
+  private var downDiagnostics: [PointerDownDiagnostic] = []
   private var sequence: UInt64 = 0
   private var activeTarget: UUID?
   private var isDiscardingOverflowSequence = false
@@ -140,7 +158,10 @@ final class PointerTapState: @unchecked Sendable {
 
   var latestPointerLocation: CGPoint? { lock.withLock { buffer.latestPointerEvent?.point } }
 
-  func configure(mode: Mode, surfaces: [PointerTargetSnapshot.Region], canStart: Bool) {
+  func configure(
+    mode: Mode, surfaces: [PointerTargetSnapshot.Region], canStart: Bool,
+    isSuspended: Bool = false
+  ) {
     lock.withLock {
       if mode != self.mode {
         routes = routes.filter { _, route in
@@ -151,6 +172,7 @@ final class PointerTapState: @unchecked Sendable {
       self.mode = mode
       self.surfaces = surfaces
       self.canStart = canStart
+      self.isSuspended = isSuspended
     }
   }
 
@@ -158,10 +180,13 @@ final class PointerTapState: @unchecked Sendable {
     lock.withLock { self.targets = targets }
   }
 
-  func drain() -> (events: [PointerInputEvent], routes: [UUID: PointerRoute]) {
+  func drain() -> (
+    events: [PointerInputEvent], routes: [UUID: PointerRoute], diagnostics: [PointerDownDiagnostic]
+  ) {
     lock.withLock {
-      let result = (buffer.drain(), routes)
+      let result = (buffer.drain(), routes, downDiagnostics)
       routes.removeAll(keepingCapacity: true)
+      downDiagnostics.removeAll(keepingCapacity: true)
       return result
     }
   }
@@ -231,13 +256,28 @@ final class PointerTapState: @unchecked Sendable {
     }
     return lock.withLock {
       guard !stopped else { return false }
+      var decision = "passed"
+      var preparedWindowID: CGWindowID = 0
+      let snapshotAge = ProcessInfo.processInfo.systemUptime - targets.windows.capturedAt
+      defer {
+        if type == .leftMouseDown, InputDiagnostics.isEnabled, downDiagnostics.count < 16 {
+          downDiagnostics.append(
+            .init(
+              mode: String(describing: mode), reason: decision,
+              eventWindowID: windowID, preparedWindowID: preparedWindowID, snapshotAge: snapshotAge)
+          )
+        }
+      }
       let latestTime = buffer.latestPointerEvent?.timestamp ?? 0
       let nowNanoseconds = clock()
       let isRecent = nowNanoseconds <= time || nowNanoseconds - time <= 250_000_000
       let isFresh = time >= latestTime && isRecent
       switch type {
       case .leftMouseDown:
-        guard isFresh else { return false }
+        guard isFresh else {
+          decision = "stale-event"
+          return false
+        }
         isDiscardingOverflowSequence = false
         // A prior release can be absent after a tap interruption. Finish that gesture
         // before accepting another click, without reusing the stale drag position.
@@ -248,6 +288,11 @@ final class PointerTapState: @unchecked Sendable {
               sequenceID: sequence, targetID: activeTarget))
           self.activeTarget = nil
         }
+        guard !isSuspended else {
+          decision = "menu-tracking"
+          _ = buffer.append(.init(kind: .moved, point: point, timestamp: time, sequenceID: 0))
+          return false
+        }
         let now = ProcessInfo.processInfo.systemUptime
         let snapshot = mode == .close ? targets.controls : targets.windows
         let surface = mode == .close ? nil : surfaces.first { $0.frame.contains(point) }
@@ -256,11 +301,14 @@ final class PointerTapState: @unchecked Sendable {
             at: point, now: now, surfaces: mode == .close ? [] : surfaces),
           surface != nil || canStart
         else {
+          decision = canStart ? "no-target" : "busy"
           _ = buffer.append(.init(kind: .moved, point: point, timestamp: time, sequenceID: 0))
           return false
         }
         let target = targets.targets[targetID]
+        preparedWindowID = target?.windowID ?? 0
         if surface == nil, windowID > 0, windowID != Int64(target?.windowID ?? 0) {
+          decision = "window-mismatch"
           return false
         }
         let route: PointerRoute
@@ -287,6 +335,7 @@ final class PointerTapState: @unchecked Sendable {
         routes[routeID] = route
         activeTarget = routeID
         activeDownTimestamp = time
+        decision = "accepted"
         return true
       case .leftMouseDragged:
         if isDiscardingOverflowSequence { return true }
