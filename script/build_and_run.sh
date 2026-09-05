@@ -65,6 +65,9 @@ case "$MODE" in
     run)
         open_app
         ;;
+    --input-diagnostics)
+        open_app --args --input-diagnostics
+        ;;
     --quality-review|quality-review)
         REVIEW_OUTPUT="${2:-$DIST_DIR/quality-review}"
         mkdir -p "$REVIEW_OUTPUT"

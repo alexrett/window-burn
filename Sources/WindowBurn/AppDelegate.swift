@@ -51,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       }
     }
     installHotKeys()
+    InputDiagnostics.start()
     coordinator.excludedCaptureWindowIDs = { [weak self] in
       self?.torchCursor.captureWindowIDs ?? []
     }

@@ -105,6 +105,7 @@ final class WindowControlInterceptor {
       let location = CGEvent(source: source)?.location
     else { return }
     let pressed = CGEventSource.buttonState(.hidSystemState, button: .left)
+    InputDiagnostics.recoverySample(point: location, isPressed: pressed)
     switch dragRecovery.sample(at: location, isPressed: pressed) {
     case .dragged:
       _ = soakAndBurnHandler(.dragged, location)
@@ -192,6 +193,11 @@ private func windowControlEventTapCallback(
   guard let userInfo else { return Unmanaged.passUnretained(event) }
   let interceptor = Unmanaged<WindowControlInterceptor>.fromOpaque(userInfo).takeUnretainedValue()
   let location = event.location
+  let startedAt = ProcessInfo.processInfo.systemUptime
+  defer {
+    InputDiagnostics.eventTap(
+      type: type, duration: ProcessInfo.processInfo.systemUptime - startedAt)
+  }
 
   let shouldSuppress = MainActor.assumeIsolated {
     interceptor.shouldSuppress(type: type, location: location)

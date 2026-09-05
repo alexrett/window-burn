@@ -365,9 +365,12 @@ final class BurnRenderer: NSObject, MTKViewDelegate {
   func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
   func draw(in view: MTKView) {
+    guard !hasCompleted else { return }
+    let drawableRequestedAt = CACurrentMediaTime()
+    let nextDrawable = view.currentDrawable
+    InputDiagnostics.drawableWait(CACurrentMediaTime() - drawableRequestedAt)
     guard
-      !hasCompleted,
-      let drawable = view.currentDrawable,
+      let drawable = nextDrawable,
       let renderPass = view.currentRenderPassDescriptor,
       let commandBuffer = commandQueue.makeCommandBuffer()
     else {

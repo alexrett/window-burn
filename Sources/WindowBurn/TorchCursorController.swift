@@ -175,6 +175,7 @@ final class TorchCursorController {
         y: point.y - style.hotSpot.y
       )
     )
+    InputDiagnostics.cursorMoved(point: point)
     updateArtwork()
   }
 
