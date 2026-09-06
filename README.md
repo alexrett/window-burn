@@ -16,13 +16,13 @@ animated torch, or soak it first for the full two-act treatment.
 
 <p align="center">
   <a href="docs/window-burn-demo.mp4">
-    <img src="docs/window-burn-demo.gif" width="800" alt="Window Burn demo: close, torch, and soak-and-burn modes">
+    <img src="docs/window-burn-demo.gif" width="800" alt="Window Burn promo: close, torch, and soak-and-burn modes with the new renderer">
   </a>
 </p>
 
 <p align="center">
   Close and burn · Torch · Soak and burn<br>
-  <a href="docs/window-burn-demo.mp4">Watch the full-quality MP4</a>
+  <a href="docs/window-burn-demo.mp4">Watch the 21-second promo in full quality</a>
 </p>
 
 > [!CAUTION]
