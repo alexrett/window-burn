@@ -2,12 +2,13 @@ import AppKit
 import ApplicationServices
 import WindowBurnCore
 
-struct AccessibleWindow {
+// AX handles are immutable references; all mutable interaction state lives in the coordinator.
+struct AccessibleWindow: @unchecked Sendable {
   let target: TargetWindow
   let element: AXUIElement
 }
 
-struct AccessibleWindowControl {
+struct AccessibleWindowControl: @unchecked Sendable {
   let window: AccessibleWindow
   let kind: WindowControlKind
   let button: AXUIElement
@@ -339,7 +340,7 @@ enum AccessibilityWindowService {
     )
   }
 
-  private static func window(matching target: TargetWindow) -> AccessibleWindow? {
+  static func window(matching target: TargetWindow) -> AccessibleWindow? {
     let application = AXUIElementCreateApplication(target.ownerPID)
     guard
       let windowValues = copyAttribute(kAXWindowsAttribute, from: application)
@@ -364,6 +365,42 @@ enum AccessibilityWindowService {
         size: size
       )
     }
+    return window(matching: target, among: windows)
+  }
+
+  /// Enumerates an application's windows once for a resolver pass. Each AX read
+  /// uses the remaining pass budget, including reads on returned child handles.
+  static func preflightWindows(
+    ownerPID: pid_t, deadline: TimeInterval
+  ) -> [AccessibleWindow] {
+    let application = AXUIElementCreateApplication(ownerPID)
+    guard
+      let elements = copyAttribute(kAXWindowsAttribute, from: application, deadline: deadline)
+        as? [AXUIElement]
+    else { return [] }
+
+    var windows: [AccessibleWindow] = []
+    for element in elements {
+      guard ProcessInfo.processInfo.systemUptime < deadline else { break }
+      guard
+        let position = pointAttribute(kAXPositionAttribute, from: element, deadline: deadline),
+        let size = sizeAttribute(kAXSizeAttribute, from: element, deadline: deadline),
+        size.width > 1, size.height > 1
+      else { continue }
+      let title = copyAttribute(kAXTitleAttribute, from: element, deadline: deadline) as? String
+      windows.append(
+        AccessibleWindow(
+          target: TargetWindow(
+            ownerPID: ownerPID, title: title, frame: CGRect(origin: position, size: size)),
+          element: element
+        ))
+    }
+    return windows
+  }
+
+  static func window(
+    matching target: TargetWindow, among windows: [AccessibleWindow]
+  ) -> AccessibleWindow? {
     let candidates = windows.enumerated().map { index, window in
       WindowCandidate(
         id: UInt32(index),
@@ -382,17 +419,54 @@ enum AccessibilityWindowService {
     return windows[Int(match.id)]
   }
 
+  /// Resolver-worker preflight; never called by the blocking mouse callback.
+  static func closeControl(
+    in window: AccessibleWindow, deadline: TimeInterval
+  ) -> (AccessibleWindowControl, CGRect)? {
+    guard
+      let value = copyAttribute(
+        kAXCloseButtonAttribute, from: window.element, deadline: deadline),
+      CFGetTypeID(value) == AXUIElementGetTypeID()
+    else { return nil }
+    let button = unsafeDowncast(value, to: AXUIElement.self)
+    guard
+      (copyAttribute(kAXEnabledAttribute, from: button, deadline: deadline) as? Bool) != false,
+      let position = pointAttribute(kAXPositionAttribute, from: button, deadline: deadline),
+      let size = sizeAttribute(kAXSizeAttribute, from: button, deadline: deadline),
+      size.width > 0, size.height > 0
+    else { return nil }
+    return (
+      AccessibleWindowControl(window: window, kind: .close, button: button),
+      CGRect(origin: position, size: size)
+    )
+  }
+
   private static func copyAttribute(
     _ attribute: String,
-    from element: AXUIElement
+    from element: AXUIElement,
+    deadline: TimeInterval? = nil
   ) -> CFTypeRef? {
+    if let deadline {
+      let remaining = deadline - ProcessInfo.processInfo.systemUptime
+      guard remaining > 0 else { return nil }
+      // AX timeouts apply only to this exact handle, not its children. Restore
+      // the global default before publishing handles used later for native actions.
+      AXUIElementSetMessagingTimeout(element, Float(min(0.05, remaining)))
+    }
+    defer {
+      if deadline != nil { AXUIElementSetMessagingTimeout(element, 0) }
+    }
     var value: CFTypeRef?
     let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
     return result == .success ? value : nil
   }
 
-  private static func pointAttribute(_ attribute: String, from element: AXUIElement) -> CGPoint? {
-    guard let value = copyAttribute(attribute, from: element) else { return nil }
+  private static func pointAttribute(
+    _ attribute: String, from element: AXUIElement, deadline: TimeInterval? = nil
+  ) -> CGPoint? {
+    guard let value = copyAttribute(attribute, from: element, deadline: deadline) else {
+      return nil
+    }
     let axValue = unsafeDowncast(value, to: AXValue.self)
     guard AXValueGetType(axValue) == .cgPoint else { return nil }
 
@@ -400,8 +474,12 @@ enum AccessibilityWindowService {
     return AXValueGetValue(axValue, .cgPoint, &point) ? point : nil
   }
 
-  private static func sizeAttribute(_ attribute: String, from element: AXUIElement) -> CGSize? {
-    guard let value = copyAttribute(attribute, from: element) else { return nil }
+  private static func sizeAttribute(
+    _ attribute: String, from element: AXUIElement, deadline: TimeInterval? = nil
+  ) -> CGSize? {
+    guard let value = copyAttribute(attribute, from: element, deadline: deadline) else {
+      return nil
+    }
     let axValue = unsafeDowncast(value, to: AXValue.self)
     guard AXValueGetType(axValue) == .cgSize else { return nil }
 

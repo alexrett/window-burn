@@ -97,8 +97,19 @@ Development checks:
 ```bash
 swift format lint --strict --recursive Package.swift Sources Tests
 swift test
+swift script/check-renderer-alpha.swift
 ./script/build_and_run.sh --verify
 ```
+
+To inspect capture fidelity and material rendering on a disposable native window:
+
+```bash
+./script/build_and_run.sh --quality-review "$PWD/dist/quality-review"
+```
+
+This saves native/cover/replacement screenshots, pixel comparisons, and GPU timings without
+closing your documents. See the [quality audit](docs/quality-audit.md) for the design,
+reproduction steps, and remaining limitations.
 
 To prepare a universal Developer ID-signed and notarized release locally:
 

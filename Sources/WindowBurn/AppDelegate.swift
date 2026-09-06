@@ -1,12 +1,14 @@
 import AppKit
 import Carbon.HIToolbox
+import Metal
 import OSLog
 import WindowBurnCore
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let logger = Logger(subsystem: "dev.malikov.WindowBurn", category: "app")
   private let coordinator = BurnCoordinator()
+  private var qualityReview: QualityReviewController?
   private let torchCursor = TorchCursorController()
   private var burnHotKey: GlobalHotKey?
   private var torchHotKey: GlobalHotKey?
@@ -19,13 +21,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var isSoakAndBurnModeEnabled = false
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    if let argumentIndex = CommandLine.arguments.firstIndex(of: "--quality-review"),
+      CommandLine.arguments.indices.contains(argumentIndex + 1)
+    {
+      let output = URL(fileURLWithPath: CommandLine.arguments[argumentIndex + 1], isDirectory: true)
+      let review = QualityReviewController()
+      qualityReview = review
+      Task { @MainActor in
+        do {
+          try await review.run(outputDirectory: output)
+        } catch {
+          try? FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+          try? "FAILED: \(error.localizedDescription)".write(
+            to: output.appendingPathComponent("status.txt"), atomically: true, encoding: .utf8
+          )
+          logger.error("Quality review failed: \(error.localizedDescription, privacy: .public)")
+        }
+        NSApp.terminate(nil)
+      }
+      return
+    }
     installStatusItem()
+    // Prewarm effects before enabling interception on the dedicated input thread.
+    if let device = MTLCreateSystemDefaultDevice() {
+      do {
+        try BurnRenderer.prewarm(device: device)
+      } catch {
+        logger.error("Effect prewarm failed: \(error.localizedDescription, privacy: .public)")
+      }
+    }
     installHotKeys()
+    InputDiagnostics.start()
+    coordinator.excludedCaptureWindowIDs = { [weak self] in
+      self?.torchCursor.captureWindowIDs ?? []
+    }
     coordinator.onSoakAndBurnPhaseChange = { [weak self] phase in
       self?.updateSoakAndBurnCursor(for: phase)
-    }
-    coordinator.onSoakCaptureStateChange = { [weak self] isCapturing in
-      self?.torchCursor.setTemporarilyHidden(isCapturing)
     }
     coordinator.onDestructiveCloseFailure = { [weak self] in
       self?.disableInteractiveModesAfterCloseFailure()
@@ -42,12 +73,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       "Window Burn is ready; accessibility=\(PermissionService.hasAccessibilityAccess), screenCapture=\(PermissionService.hasScreenCaptureAccess), inputMonitoring=\(PermissionService.hasInputMonitoringAccess)"
     )
     if isDemoLaunch {
-      DispatchQueue.main.async { [weak self] in
-        self?.coordinator.showDemo()
+      Task { @MainActor [weak self] in
+        await self?.coordinator.showDemo()
       }
     } else if isSoakDemoLaunch {
-      DispatchQueue.main.async { [weak self] in
-        self?.coordinator.showSoakDemo()
+      Task { @MainActor [weak self] in
+        await self?.coordinator.showSoakDemo()
       }
     } else if isTorchLaunch {
       DispatchQueue.main.async { [weak self] in
@@ -79,6 +110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     item.button?.toolTip = "Window Burn — burn ⌃⌥⌘B, torch ⌃⌥⌘F, soak & burn ⌃⌥⌘U"
 
     let menu = NSMenu()
+    menu.delegate = self
     let burnItem = NSMenuItem(
       title: "Burn & Close Front Window",
       action: #selector(burnFrontWindow),
@@ -154,6 +186,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     statusItem = item
   }
 
+  func menuWillOpen(_ menu: NSMenu) {
+    windowControlInterceptor?.isMenuTracking = true
+  }
+
+  func menuDidClose(_ menu: NSMenu) {
+    windowControlInterceptor?.isMenuTracking = false
+  }
+
   private func installHotKeys() {
     do {
       burnHotKey = try GlobalHotKey(
@@ -190,30 +230,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closeHandler: { [weak self] control in
           self?.coordinator.interceptWindowControl(control) ?? false
         },
-        torchHandler: { [weak self] location in
-          guard let self else { return false }
-          return torchCursor.withoutOverlay {
-            coordinator.interceptTorchClick(at: location)
-          }
+        torchHandler: { [weak self] location, window in
+          self?.coordinator.interceptTorchClick(
+            at: location, resolvedWindow: window
+          ) ?? false
         },
-        soakAndBurnHandler: { [weak self] event, location in
-          guard let self else { return false }
-          switch event {
-          case .down:
-            torchCursor.beginPointerDrag(atQuartzPoint: location)
-          case .dragged:
-            torchCursor.move(toQuartzPoint: location)
-          case .up:
-            torchCursor.endPointerDrag(atQuartzPoint: location)
-          }
-          if case .down = event {
-            return torchCursor.withoutOverlay {
-              coordinator.interceptSoakAndBurn(event, at: location)
-            }
-          }
-          return coordinator.interceptSoakAndBurn(event, at: location)
+        soakAndBurnHandler: { [weak self] event, location, window in
+          self?.coordinator.interceptSoakAndBurn(
+            event, at: location, resolvedWindow: window
+          ) ?? false
         }
       )
+      windowControlInterceptor?.interactionState = { [weak self] in
+        self?.coordinator.pointerInteractionState ?? ([], false)
+      }
+      torchCursor.pointerLocation = { [weak self] in
+        self?.windowControlInterceptor?.latestPointerLocation
+      }
     } catch {
       logger.error(
         "Mouse interception is unavailable: \(error.localizedDescription, privacy: .public)"
@@ -226,7 +259,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   @objc private func showDemo() {
-    coordinator.showDemo()
+    Task { await coordinator.showDemo() }
   }
 
   @objc private func toggleTorchMode() {

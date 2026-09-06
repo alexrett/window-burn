@@ -33,8 +33,16 @@ final class BurnCoordinator {
   private var soakGeneration = 0
   private var soakCloseTask: Task<Void, Never>?
   var onSoakAndBurnPhaseChange: ((SoakAndBurnPhase) -> Void)?
-  var onSoakCaptureStateChange: ((Bool) -> Void)?
   var onDestructiveCloseFailure: (() -> Void)?
+  var excludedCaptureWindowIDs: (() -> Set<CGWindowID>)?
+
+  private let soakSurfaceID = UUID()
+  var pointerInteractionState: (surfaces: [PointerTargetSnapshot.Region], canStart: Bool) {
+    if let soakCaptureFrame {
+      return ([.init(id: soakSurfaceID, frame: soakCaptureFrame)], false)
+    }
+    return (torchSessionRegistry.interactionRegions, !isBusy && !torchSessionRegistry.isAtCapacity)
+  }
 
   func burnFrontWindow() {
     guard !isBusy, torchSessions.isEmpty else { return }
@@ -46,7 +54,8 @@ final class BurnCoordinator {
       do {
         let accessibleWindow = try AccessibilityWindowService.focusedWindow()
         let capturedWindow = try await WindowCaptureService.capture(
-          target: accessibleWindow.target
+          target: accessibleWindow.target,
+          excludingWindowIDs: excludedCaptureWindowIDs?() ?? []
         )
         let panelFrame = ScreenCoordinateConverter.appKitFrame(
           for: capturedWindow.captureFrame,
@@ -55,18 +64,18 @@ final class BurnCoordinator {
         )
         let profile = BurnProfile.random()
 
-        try overlay.present(
+        try await overlay.present(
           image: capturedWindow.image,
+          handoffImage: capturedWindow.handoffImage,
           shadowImage: capturedWindow.shadowImage,
           shadowSamplingOffset: capturedWindow.shadowSamplingOffset,
           panelFrame: panelFrame,
           profile: profile,
           startImmediately: false,
-          onFirstFrame: nil,
           completion: { [weak self] in self?.isBusy = false }
         )
         try await AccessibilityWindowService.closeDiscardingUnsavedChanges(accessibleWindow)
-        guard overlay.activateReplacementSurface() else {
+        guard try await overlay.activateReplacementSurface() else {
           throw BurnOverlayError.rendererUnavailable
         }
         overlay.startBurning()
@@ -93,7 +102,8 @@ final class BurnCoordinator {
 
       do {
         let capturedWindow = try await WindowCaptureService.capture(
-          target: control.window.target
+          target: control.window.target,
+          excludingWindowIDs: excludedCaptureWindowIDs?() ?? []
         )
         let panelFrame = ScreenCoordinateConverter.appKitFrame(
           for: capturedWindow.captureFrame,
@@ -102,14 +112,14 @@ final class BurnCoordinator {
         )
         let profile = BurnProfile.random()
 
-        try overlay.present(
+        try await overlay.present(
           image: capturedWindow.image,
+          handoffImage: capturedWindow.handoffImage,
           shadowImage: capturedWindow.shadowImage,
           shadowSamplingOffset: capturedWindow.shadowSamplingOffset,
           panelFrame: panelFrame,
           profile: profile,
           startImmediately: false,
-          onFirstFrame: nil,
           completion: { [weak self] in self?.isBusy = false }
         )
         try AccessibilityWindowService.perform(control)
@@ -117,7 +127,7 @@ final class BurnCoordinator {
         try await AccessibilityWindowService.finishClosingDiscardingUnsavedChanges(
           control.window
         )
-        guard overlay.activateReplacementSurface() else {
+        guard try await overlay.activateReplacementSurface() else {
           throw BurnOverlayError.rendererUnavailable
         }
         overlay.startBurning()
@@ -150,7 +160,9 @@ final class BurnCoordinator {
     return true
   }
 
-  func interceptTorchClick(at screenPoint: CGPoint) -> Bool {
+  func interceptTorchClick(
+    at screenPoint: CGPoint, resolvedWindow: AccessibleWindow?
+  ) -> Bool {
     if let sessionID = torchSessionRegistry.sessionID(containing: screenPoint),
       let session = torchSessions[sessionID],
       let ignition = TorchBurnGeometry.normalizedIgnition(
@@ -184,7 +196,7 @@ final class BurnCoordinator {
 
     guard
       !isBusy,
-      let accessibleWindow = AccessibilityWindowService.window(at: screenPoint),
+      let accessibleWindow = resolvedWindow,
       TorchBurnGeometry.normalizedIgnition(
         screenPoint: screenPoint,
         captureFrame: accessibleWindow.target.frame
@@ -213,7 +225,8 @@ final class BurnCoordinator {
       do {
         guard let session = torchSessions[sessionID] else { return }
         let capturedWindow = try await WindowCaptureService.capture(
-          target: session.accessibleWindow.target
+          target: session.accessibleWindow.target,
+          excludingWindowIDs: excludedCaptureWindowIDs?() ?? []
         )
         guard let session = torchSessions[sessionID] else { return }
         let panelFrame = ScreenCoordinateConverter.appKitFrame(
@@ -241,27 +254,35 @@ final class BurnCoordinator {
           throw WindowCaptureError.noMatchingWindow
         }
         let profile = BurnProfile.randomTorch()
-        try session.overlay.present(
+        session.pendingClicks = []
+        try await session.overlay.present(
           image: capturedWindow.image,
+          handoffImage: capturedWindow.handoffImage,
           shadowImage: capturedWindow.shadowImage,
           shadowSamplingOffset: capturedWindow.shadowSamplingOffset,
           panelFrame: panelFrame,
           profile: profile,
           style: .torch(initialIgnitions: ignitionPoints),
           startImmediately: false,
-          onFirstFrame: nil,
           completion: { [weak self] in
             self?.finishTorchBurn(sessionID)
           }
         )
-        session.isOverlayReady = true
+        for click in session.pendingClicks {
+          if let ignition = TorchBurnGeometry.normalizedIgnition(
+            screenPoint: click, captureFrame: session.captureFrame
+          ) {
+            _ = session.overlay.addIgnition(ignition)
+          }
+        }
         session.pendingClicks = []
+        session.isOverlayReady = true
         try await AccessibilityWindowService.closeDiscardingUnsavedChanges(
           session.accessibleWindow
         )
         guard
           torchSessions[sessionID] != nil,
-          session.overlay.activateReplacementSurface()
+          try await session.overlay.activateReplacementSurface()
         else {
           throw BurnOverlayError.rendererUnavailable
         }
@@ -285,13 +306,14 @@ final class BurnCoordinator {
 
   func interceptSoakAndBurn(
     _ event: SoakAndBurnPointerEvent,
-    at screenPoint: CGPoint
+    at screenPoint: CGPoint, resolvedWindow: AccessibleWindow?
   ) -> Bool {
     switch event {
     case .down:
       switch soakAndBurnSession.phase {
       case .readyToSoak:
-        return beginSoaking(at: screenPoint)
+        return beginSoaking(
+          at: screenPoint, resolvedWindow: resolvedWindow)
       case .readyToBurn:
         return igniteSoakedWindow(at: screenPoint)
       case .soaking, .burning:
@@ -325,7 +347,7 @@ final class BurnCoordinator {
     logger.info("Soak-and-burn mode was cancelled")
   }
 
-  func showDemo() {
+  func showDemo() async {
     guard !isBusy, torchSessions.isEmpty else { return }
     isBusy = true
     logger.info("Starting demo burn")
@@ -343,12 +365,11 @@ final class BurnCoordinator {
         height: size.height
       )
       let profile = BurnProfile.random()
-      try overlay.present(
+      try await overlay.present(
         image: image,
         panelFrame: contentFrame,
         profile: profile,
         presentation: .demoWindow,
-        onFirstFrame: nil,
         completion: { [weak self] in
           self?.isBusy = false
           self?.logger.info("Demo burn completed")
@@ -361,7 +382,7 @@ final class BurnCoordinator {
     }
   }
 
-  func showSoakDemo() {
+  func showSoakDemo() async {
     guard !isBusy, torchSessions.isEmpty else { return }
     isBusy = true
     logger.info("Starting soak-and-burn demo")
@@ -392,13 +413,12 @@ final class BurnCoordinator {
         BurnIgnitionPoint(x: 0.56, y: 0.46),
         BurnIgnitionPoint(x: 0.50, y: 0.50),
       ]
-      try overlay.present(
+      try await overlay.present(
         image: image,
         panelFrame: contentFrame,
         profile: profile,
         style: .soakAndBurn(initialSoakPoints: [soakPoints[0]]),
         presentation: .demoWindow,
-        onFirstFrame: nil,
         completion: { [weak self] in
           self?.isBusy = false
           self?.logger.info("Soak-and-burn demo completed")
@@ -439,11 +459,13 @@ final class BurnCoordinator {
     )
   }
 
-  private func beginSoaking(at screenPoint: CGPoint) -> Bool {
+  private func beginSoaking(
+    at screenPoint: CGPoint, resolvedWindow: AccessibleWindow?
+  ) -> Bool {
     guard
       !isBusy,
       torchSessions.isEmpty,
-      let accessibleWindow = AccessibilityWindowService.window(at: screenPoint),
+      let accessibleWindow = resolvedWindow,
       TorchBurnGeometry.normalizedIgnition(
         screenPoint: screenPoint,
         captureFrame: accessibleWindow.target.frame
@@ -468,20 +490,18 @@ final class BurnCoordinator {
     isSoakOverlayActive = false
     pendingSoakRelease = false
     notifySoakAndBurnPhaseChange()
-    onSoakCaptureStateChange?(true)
 
     Task { @MainActor [weak self] in
       guard let self else { return }
 
       do {
-        // Ordering a cursor panel out is asynchronous at the WindowServer boundary.
-        // Give it several display frames before ScreenCaptureKit snapshots the target.
-        try await Task.sleep(for: .milliseconds(80))
+        // ScreenCaptureKit excludes the cursor panel by ID, so no timing delay is needed.
         guard generation == soakGeneration, soakAndBurnSession.phase != .readyToSoak else {
           return
         }
         let capturedWindow = try await WindowCaptureService.capture(
-          target: accessibleWindow.target
+          target: accessibleWindow.target,
+          excludingWindowIDs: excludedCaptureWindowIDs?() ?? []
         )
         guard generation == soakGeneration, soakAndBurnSession.phase != .readyToSoak else {
           return
@@ -492,28 +512,34 @@ final class BurnCoordinator {
           padding: BurnOverlayController.padding
         )
         let initialSoakPoints = pendingSoakTrail.points
+        pendingSoakTrail = SoakTrail()
         guard !initialSoakPoints.isEmpty else {
           throw WindowCaptureError.noMatchingWindow
         }
 
         soakCaptureFrame = capturedWindow.captureFrame
         let profile = BurnProfile.randomTorch()
-        try overlay.present(
+        try await overlay.present(
           image: capturedWindow.image,
           backdropImage: capturedWindow.backdropImage,
+          handoffImage: capturedWindow.handoffImage,
           shadowImage: capturedWindow.shadowImage,
           shadowSamplingOffset: capturedWindow.shadowSamplingOffset,
           panelFrame: panelFrame,
           profile: profile,
           style: .soakAndBurn(initialSoakPoints: initialSoakPoints),
-          onFirstFrame: nil,
           completion: { [weak self] in
             self?.finishSoakAndBurn()
           }
         )
-        isSoakOverlayActive = true
+        guard generation == soakGeneration, soakAndBurnSession.phase != .readyToSoak else {
+          return
+        }
+        for point in pendingSoakTrail.points {
+          _ = overlay.addSoakPoint(point)
+        }
         pendingSoakTrail = SoakTrail()
-        onSoakCaptureStateChange?(false)
+        isSoakOverlayActive = true
         if pendingSoakRelease || soakAndBurnSession.phase == .readyToBurn {
           pendingSoakRelease = false
           _ = overlay.finishSoaking()
@@ -522,6 +548,8 @@ final class BurnCoordinator {
           "Started soaking pid \(accessibleWindow.target.ownerPID) with \(initialSoakPoints.count) sampled point(s)"
         )
       } catch {
+        guard generation == soakGeneration else { return }
+        overlay.dismiss()
         resetSoakAndBurn()
         logger.error("Soaking failed: \(error.localizedDescription, privacy: .public)")
         showError(error)
@@ -551,16 +579,26 @@ final class BurnCoordinator {
     soakCloseTask = Task { @MainActor [weak self] in
       guard let self else { return }
       do {
-        guard overlay.prepareForIgnitionHandoff() else {
+        guard generation == soakGeneration, !Task.isCancelled else { return }
+        let handoffImage = await WindowCaptureService.captureHandoff(
+          targetFrame: captureFrame,
+          excludingWindowIDs: excludedCaptureWindowIDs?() ?? []
+        )
+        guard generation == soakGeneration, !Task.isCancelled else { return }
+        let handoffPrepared = try await overlay.prepareForIgnitionHandoff(
+          handoffImage: handoffImage)
+        guard generation == soakGeneration, !Task.isCancelled else { return }
+        guard handoffPrepared else {
           overlay.dismiss()
           resetSoakAndBurn()
           return
         }
         try await AccessibilityWindowService.closeDiscardingUnsavedChanges(accessibleWindow)
         guard generation == soakGeneration, !Task.isCancelled else { return }
-        soakCloseTask = nil
+        let replacementActive = try await overlay.activateReplacementSurface()
+        guard generation == soakGeneration, !Task.isCancelled else { return }
         guard
-          overlay.activateReplacementSurface(),
+          replacementActive,
           soakAndBurnSession.beginBurning(),
           overlay.igniteSoakedWindow(at: ignition)
         else {
@@ -568,6 +606,7 @@ final class BurnCoordinator {
           resetSoakAndBurn()
           return
         }
+        soakCloseTask = nil
         notifySoakAndBurnPhaseChange()
         logger.info(
           "Ignited the soaked window for pid \(accessibleWindow.target.ownerPID) at \(ignition.x, format: .fixed(precision: 2)), \(ignition.y, format: .fixed(precision: 2))"
@@ -575,6 +614,7 @@ final class BurnCoordinator {
       } catch is CancellationError {
         return
       } catch {
+        guard generation == soakGeneration else { return }
         soakCloseTask = nil
         overlay.dismiss()
         resetSoakAndBurn()
@@ -616,7 +656,6 @@ final class BurnCoordinator {
   private func resetSoakAndBurn() {
     soakCloseTask?.cancel()
     soakCloseTask = nil
-    onSoakCaptureStateChange?(false)
     soakGeneration += 1
     isBusy = false
     soakAndBurnSession.reset()

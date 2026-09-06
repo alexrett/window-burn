@@ -65,6 +65,14 @@ case "$MODE" in
     run)
         open_app
         ;;
+    --input-diagnostics)
+        open_app --args --input-diagnostics "${@:2}"
+        ;;
+    --quality-review|quality-review)
+        REVIEW_OUTPUT="${2:-$DIST_DIR/quality-review}"
+        mkdir -p "$REVIEW_OUTPUT"
+        open_app --args --quality-review "$REVIEW_OUTPUT"
+        ;;
     --demo|demo)
         open_app --args --demo
         ;;
@@ -94,7 +102,7 @@ case "$MODE" in
         pgrep -x "$PROCESS_NAME" >/dev/null
         ;;
     *)
-        echo "usage: $0 [run|--demo|--demo-soak|--torch|--soak-and-burn|--debug|--logs|--telemetry|--verify]" >&2
+        echo "usage: $0 [run|--input-diagnostics [--torch|--soak-and-burn]|--quality-review [output-directory]|--demo|--demo-soak|--torch|--soak-and-burn|--debug|--logs|--telemetry|--verify]" >&2
         exit 2
         ;;
 esac

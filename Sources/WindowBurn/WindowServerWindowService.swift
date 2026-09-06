@@ -6,17 +6,17 @@ import WindowBurnCore
 enum WindowServerWindowService {
   private static let logger = Logger(subsystem: "dev.malikov.WindowBurn", category: "resolver")
 
-  static func targetWindow(at point: CGPoint) -> TargetWindow? {
+  static func onScreenWindows() -> [PointWindowCandidate] {
     guard
       let windowInfo = CGWindowListCopyWindowInfo(
         [.optionOnScreenOnly, .excludeDesktopElements],
         kCGNullWindowID
       ) as? [[String: Any]]
     else {
-      return nil
+      return []
     }
 
-    let candidates = windowInfo.compactMap { info -> PointWindowCandidate? in
+    return windowInfo.compactMap { info -> PointWindowCandidate? in
       guard
         let id = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
         let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
@@ -41,10 +41,13 @@ enum WindowServerWindowService {
       )
     }
 
+  }
+
+  static func targetWindow(at point: CGPoint) -> TargetWindow? {
     guard
       let match = WindowAtPointMatcher.frontmost(
         at: point,
-        amongFrontToBack: candidates,
+        amongFrontToBack: onScreenWindows(),
         excludingPID: ProcessInfo.processInfo.processIdentifier
       )
     else {

@@ -13,15 +13,15 @@ struct WetVisualProfileTests {
     #expect(profile.dispersionStrength < profile.refractionStrength)
   }
 
-  @Test("The stain remains matte while the absorbed background stays blurred")
+  @Test("Absorption preserves readable texture rather than turning into a blur mask")
   func matteStainPreservesTheCapturedWindow() {
     let profile = WetVisualProfile.cinematic
 
     #expect((0.015...0.06).contains(profile.reflectionStrength))
     #expect((0.10...0.32).contains(profile.highlightIntensity))
     #expect((0.40...0.68).contains(profile.urineTintStrength))
-    #expect((0.018...0.032).contains(profile.backgroundBlurRadius))
-    #expect((0.82...0.98).contains(profile.backgroundBlurStrength))
+    #expect(profile.backgroundBlurRadius < 0.005)
+    #expect(profile.backgroundBlurStrength < 0.4)
   }
 
   @Test("Droplets break up the impact without carpeting the wet patch")

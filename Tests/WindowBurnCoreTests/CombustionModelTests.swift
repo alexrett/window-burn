@@ -4,6 +4,40 @@ import Testing
 
 @Suite("Stateful combustion")
 struct CombustionModelTests {
+  @Test("A paused simulation cannot acquire heat from its neighbors or source")
+  func zeroTimeDoesNotEvolveMaterial() {
+    let state = CombustionCellState(heat: 0.2, moisture: 0.4, fuel: 0.9, damage: 0.1)
+    let next = CombustionModel.step(
+      state: state,
+      neighboringHeat: 1,
+      sourceHeat: 1,
+      deltaTime: 0,
+      profile: .cinematic
+    )
+    #expect(next == state)
+  }
+
+  @Test("Heat conduction scales with elapsed time rather than refresh rate")
+  func heatConductionIsIndependentOfRefreshRate() {
+    func simulatedHeat(frames: Int) -> Float {
+      var state = CombustionCellState(heat: 0, moisture: 0, fuel: 0, damage: 1)
+      for _ in 0..<frames {
+        state = CombustionModel.step(
+          state: state,
+          neighboringHeat: 0.2,
+          sourceHeat: 0,
+          deltaTime: 1 / Float(frames),
+          profile: .cinematic
+        )
+      }
+      return state.heat
+    }
+    let thirtyHertz = simulatedHeat(frames: 30)
+    let oneTwentyHertz = simulatedHeat(frames: 120)
+    #expect(abs(thirtyHertz - oneTwentyHertz) < 0.003)
+    #expect(thirtyHertz > 0 && thirtyHertz < 0.2)
+  }
+
   @Test("Dry material ignites and loses fuel")
   func dryMaterialBurns() {
     let next = CombustionModel.step(
@@ -149,6 +183,20 @@ struct CombustionModelTests {
 
     #expect(fresh.scorchOpacity == 0)
     #expect(damaged.scorchOpacity > fresh.scorchOpacity)
+  }
+
+  @Test("Char remains dark while damaged material is still visible")
+  func charDoesNotTurnBackIntoUnburnedPaper() {
+    let response = CombustionVisualModel.response(
+      depositedMoisture: 0,
+      remainingMoisture: 0,
+      heat: 0.3,
+      damage: 0.9,
+      progress: 0.6,
+      isRadial: true
+    )
+    #expect(response.scorchOpacity > 0.9)
+    #expect(response.materialVisibility > 0)
   }
 
   @Test("Radial fire remains attached to its front instead of globally fading")
