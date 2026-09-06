@@ -50,11 +50,17 @@ final class WindowControlInterceptor {
     self.soakAndBurnHandler = soakAndBurnHandler
     try input.start()
     resolver = PointerTargetResolver { [input] in input.publishTargets($0) }
-    let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-      MainActor.assumeIsolated { self?.drain() }
+    drainTimer = Self.scheduleDrain { [weak self] in self?.drain() }
+  }
+
+  static func scheduleDrain(_ drain: @escaping @MainActor () -> Void) -> Timer {
+    let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { _ in
+      // The timer is installed only on RunLoop.main below. Keep delivery
+      // synchronous in common modes, including AppKit menu/drag tracking.
+      MainActor.assumeIsolated { drain() }
     }
     RunLoop.main.add(timer, forMode: .common)
-    drainTimer = timer
+    return timer
   }
 
   func stop() {
