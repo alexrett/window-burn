@@ -118,6 +118,33 @@ windows, expired snapshots, native-window identity mismatch, stale coordinates,
 and full-queue shielding. These tests construct events but never post UI input.
 The separate fixture is intentionally local under ignored `dist/input-review`.
 
+## MainActor timer review — 2026-09-06
+
+[Copilot's review of PR #5](https://github.com/alexrett/window-burn/pull/5#discussion_r3943913068)
+questioned `MainActor.assumeIsolated` in the timer callback and suggested an
+asynchronous `Task { @MainActor ... }` instead. The callback type itself does not
+express actor isolation, but this timer is explicitly installed on `RunLoop.main`
+in common modes. It is created and invalidated from the main actor. Its private
+production owner never fires it manually or adds it to another run loop.
+
+[Apple documents](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/RunLoopManagement/RunLoopManagement.html)
+synchronous timer delivery on the owning run loop and the default, event-tracking
+and modal modes included in AppKit's common modes. The production scheduler is
+now a small testable method, with the scheduling invariant next to the runtime
+isolation assertion.
+
+`PointerDrainTimerTests` services the actual production timer source, without
+posting mouse input. It checks MainActor isolation both between actor jobs and
+inside nested default, event-tracking and modal run loops. The synchronous
+implementation passes all four cases. Temporarily replacing its callback with
+the proposed `Task` caused all three nested-loop cases to observe zero drains
+before their loop returned. This demonstrates a delivery-order difference in
+that scenario, not a claim that every asynchronous timer callback is incorrect.
+The synchronous implementation is retained; the reported isolation failure was
+not reproduced. No timer frequency, pointer routing or rendering behavior changed.
+Local validation passes: all 125 tests, strict Swift format lint, and the universal
+arm64/x86_64 release build.
+
 Run diagnostics with:
 
 ```sh
