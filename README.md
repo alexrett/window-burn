@@ -101,7 +101,7 @@ swift script/check-renderer-alpha.swift
 ./script/build_and_run.sh --verify
 ```
 
-To inspect the experimental capture and material improvements on a disposable native window:
+To inspect capture fidelity and material rendering on a disposable native window:
 
 ```bash
 ./script/build_and_run.sh --quality-review "$PWD/dist/quality-review"
