@@ -142,7 +142,14 @@ before their loop returned. This demonstrates a delivery-order difference in
 that scenario, not a claim that every asynchronous timer callback is incorrect.
 The synchronous implementation is retained; the reported isolation failure was
 not reproduced. No timer frequency, pointer routing or rendering behavior changed.
-Local validation passes: all 125 tests, strict Swift format lint, and the universal
+The follow-up review correctly identified test pollution from adding modes to the
+main run loop's common-mode set. Extra test modes are now registered only on the
+timer under test and removed by invalidation. This probes actor isolation and
+synchronous delivery, not AppKit's initialization of its common-mode set. A
+regression test places a separate timer in common modes: the old test setup fired
+it four times in a new private mode; the isolated setup leaves it untouched.
+
+Local validation passes: all 126 tests, strict Swift format lint, and the universal
 arm64/x86_64 release build.
 
 Run diagnostics with:
