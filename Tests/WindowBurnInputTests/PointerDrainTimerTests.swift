@@ -5,16 +5,17 @@ import Testing
 
 @Suite(.serialized) struct PointerDrainTimerTests {
   @Test(.timeLimit(.minutes(1)))
-  @MainActor func drainsBetweenActorJobs() async {
-    var timer: Timer?
-    await withCheckedContinuation { continuation in
-      timer = WindowControlInterceptor.scheduleDrain {
-        MainActor.preconditionIsolated()
-        #expect(Thread.isMainThread)
-        timer?.invalidate()
-        timer = nil
-        continuation.resume()
-      }
+  @MainActor func drainsBetweenActorJobs() async throws {
+    var drains = 0
+    let timer = WindowControlInterceptor.scheduleDrain {
+      MainActor.preconditionIsolated()
+      #expect(Thread.isMainThread)
+      drains += 1
+    }
+    defer { timer.invalidate() }
+    // Sleep cooperatively so a timeout/cancellation also invalidates the timer.
+    while drains == 0 {
+      try await Task.sleep(for: .milliseconds(10))
     }
   }
 

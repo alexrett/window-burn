@@ -148,6 +148,9 @@ timer under test and removed by invalidation. This probes actor isolation and
 synchronous delivery, not AppKit's initialization of its common-mode set. A
 regression test places a separate timer in common modes: the old test setup fired
 it four times in a new private mode; the isolated setup leaves it untouched.
+The asynchronous probe also uses cancellable waits and unconditional deferred
+timer invalidation, so timeout/cancellation can clean up without a timer callback
+having to resume a continuation first.
 
 Local validation passes: all 126 tests, strict Swift format lint, and the universal
 arm64/x86_64 release build.
